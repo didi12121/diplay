@@ -38,7 +38,6 @@ class ProjectionMediaSinkAdapter(
     }
 
     override fun onVideoFrame(frame: ProjectionVideoFrame) {
-        sink.onVideoCodec(screenType, ProjectionMediaMapping.toSharedCodec(frame.codec))
         sink.onVideoFrame(screenType, frame.bytes())
     }
 

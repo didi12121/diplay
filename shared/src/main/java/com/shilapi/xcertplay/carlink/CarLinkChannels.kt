@@ -3,106 +3,162 @@ package com.shilapi.xcertplay.carlink
 import com.shilapi.xcertplay.projection.ProjectionAudioFormat
 import com.shilapi.xcertplay.projection.ProjectionAudioSink
 import com.shilapi.xcertplay.projection.ProjectionAudioStreamId
-import com.shilapi.xcertplay.projection.ProjectionAudioChannel
-import com.shilapi.xcertplay.projection.ProjectionAudioCodec
 import com.shilapi.xcertplay.projection.ProjectionKeyEvent
 import com.shilapi.xcertplay.projection.ProjectionMetadata
 import com.shilapi.xcertplay.projection.ProjectionTouchEvent
-import com.shilapi.xcertplay.projection.ProjectionVideoCodec
 import com.shilapi.xcertplay.projection.ProjectionVideoConfig
 import com.shilapi.xcertplay.projection.ProjectionVideoFrame
 import com.shilapi.xcertplay.projection.ProjectionVideoSink
 
 /**
- * CarLink video channel: converts adapter video callbacks into neutral
- * [ProjectionVideoFrame]s and forwards them to a [ProjectionVideoSink]
- * (typically `ProjectionMediaSinkAdapter` over `AndroidMediaSink`).
+ * CarLink video channel: forwards neutral [ProjectionVideoConfig]/
+ * [ProjectionVideoFrame] objects from the protocol adapter to the session's
+ * [ProjectionVideoSink] (typically `ProjectionMediaSinkAdapter` over
+ * `AndroidMediaSink`). Codec, size, PTS, keyframe flag and payload windows are
+ * preserved as-is — no zeroing, no copying, no string codec guessing here.
+ *
+ * The sink is bound per session ([bind]/[unbind]); frames outside a session are
+ * dropped with a diagnostic instead of being silently swallowed.
  */
 class CarLinkVideoChannel(
-    private val sink: ProjectionVideoSink,
     private val diagnostics: CarLinkDiagnostics,
 ) {
-    fun onConfig(codecName: String, codecData: ByteArray) {
-        val codec = codecOf(codecName)
-        diagnostics.event("video-config", "codec=${codec.name} bytes=${codecData.size}")
-        sink.onVideoConfig(ProjectionVideoConfig(codec, codecData))
+    @Volatile
+    private var sink: ProjectionVideoSink? = null
+
+    fun bind(sink: ProjectionVideoSink) {
+        this.sink = sink
     }
 
-    fun onFrame(codecName: String, keyFrame: Boolean, payload: ByteArray, offset: Int, length: Int) {
-        sink.onVideoFrame(
-            ProjectionVideoFrame(
-                codec = codecOf(codecName),
-                width = 0,
-                height = 0,
-                presentationTimeUs = 0L,
-                keyFrame = keyFrame,
-                payload = payload,
-                offset = offset,
-                length = length,
-            ),
-        )
+    fun unbind() {
+        sink = null
+    }
+
+    fun onConfig(config: ProjectionVideoConfig) {
+        val target = sink ?: run {
+            diagnostics.event("video-config-dropped", "no-session-sink")
+            return
+        }
+        diagnostics.event("video-config", "codec=${config.codec.name} bytes=${config.codecData.size}")
+        target.onVideoConfig(config)
+    }
+
+    fun onFrame(frame: ProjectionVideoFrame) {
+        val target = sink ?: run {
+            diagnostics.event("video-frame-dropped", "no-session-sink")
+            return
+        }
+        target.onVideoFrame(frame)
     }
 
     fun onActive(active: Boolean) {
         diagnostics.event("video-stream", "active=$active")
-        sink.onVideoStreamActive(active)
+        sink?.onVideoStreamActive(active)
     }
-
-    private fun codecOf(name: String): ProjectionVideoCodec =
-        if (name.equals("h265", true) || name.equals("hevc", true)) ProjectionVideoCodec.H265
-        else ProjectionVideoCodec.H264
 }
 
 /**
- * CarLink audio channel: converts adapter audio callbacks into neutral audio
- * frames. Channel roles come from the protocol; wire types stay in metadata
- * only so nothing Apple-specific leaks into the shared layer.
+ * CarLink audio channel: explicit per-stream lifecycle ([start] → [frame] →
+ * [stop]) mapped onto the neutral [ProjectionAudioSink]. Frames of streams that
+ * were never started are dropped with a diagnostic instead of silently.
+ *
+ * The sink is bound per session ([bind]/[unbind]).
  */
 class CarLinkAudioChannel(
-    private val sink: ProjectionAudioSink,
     private val diagnostics: CarLinkDiagnostics,
-    private val streamId: Int = 1,
 ) {
-    private var open = false
+    @Volatile
+    private var sink: ProjectionAudioSink? = null
 
-    fun start(codec: ProjectionAudioCodec, sampleRate: Int, channels: Int, role: ProjectionAudioChannel) {
-        val id = ProjectionAudioStreamId(streamId, role)
-        sink.onAudioStarted(
+    /** Stream ids currently open; frame delivery requires membership. */
+    private val open = java.util.concurrent.ConcurrentHashMap<Int, ProjectionAudioStreamId>()
+
+    fun bind(sink: ProjectionAudioSink) {
+        this.sink = sink
+    }
+
+    fun unbind() {
+        sink = null
+        open.clear()
+    }
+
+    fun start(format: CarLinkAudioFormat) {
+        val target = sink ?: run {
+            diagnostics.event("audio-start-dropped", "no-session-sink")
+            return
+        }
+        val id = ProjectionAudioStreamId(format.streamId, format.role)
+        open[format.streamId] = id
+        target.onAudioStarted(
             id,
-            ProjectionAudioFormat(codec, sampleRate, channels, role),
+            ProjectionAudioFormat(
+                codec = format.codec,
+                sampleRate = format.sampleRate,
+                channels = format.channels,
+                channel = format.role,
+                payloadType = format.payloadType,
+            ),
         )
-        open = true
-        diagnostics.event("audio-start", "role=${role.name} rate=$sampleRate channels=$channels")
+        diagnostics.event(
+            "audio-start",
+            "stream=${format.streamId} role=${format.role.name} rate=${format.sampleRate} " +
+                "channels=${format.channels} codec=${format.codec.name}",
+        )
     }
 
-    fun frame(role: ProjectionAudioChannel, presentationTimeUs: Long, payload: ByteArray) {
-        if (!open) return
-        sink.onAudioFrame(ProjectionAudioStreamId(streamId, role), presentationTimeUs, payload)
+    fun frame(frame: CarLinkAudioFrame) {
+        val target = sink ?: run {
+            diagnostics.event("audio-frame-dropped", "no-session-sink")
+            return
+        }
+        val id = open[frame.streamId]
+        if (id == null) {
+            // Not a started stream: never silently swallow real audio.
+            diagnostics.event("audio-frame-unknown-stream", "stream=${frame.streamId}")
+            return
+        }
+        target.onAudioFrame(id, frame.presentationTimeUs, frame.payload, frame.offset, frame.length)
     }
 
-    fun stop(role: ProjectionAudioChannel) {
-        if (!open) return
-        open = false
-        sink.onAudioStopped(ProjectionAudioStreamId(streamId, role))
-        diagnostics.event("audio-stop", "role=${role.name}")
+    fun stop(streamId: Int) {
+        val id = open.remove(streamId) ?: run {
+            diagnostics.event("audio-stop-unknown-stream", "stream=$streamId")
+            return
+        }
+        sink?.onAudioStopped(id)
+        diagnostics.event("audio-stop", "stream=$streamId role=${id.channel.name}")
+    }
+
+    /** Stops every open stream (session teardown). */
+    fun stopAll() {
+        for (streamId in open.keys.toList()) stop(streamId)
     }
 }
 
 /**
  * CarLink input channel: forwards unified touch/key events to the protocol
  * adapter. Coordinate conversion into protocol space is the adapter's job.
+ * Adapter exceptions are swallowed and reported — input never crashes the UI
+ * thread.
  */
 class CarLinkInputChannel(
     private val adapter: CarLinkProtocolAdapter,
+    private val diagnostics: CarLinkDiagnostics,
 ) {
-    fun onTouch(event: ProjectionTouchEvent): Boolean {
+    fun onTouch(event: ProjectionTouchEvent): Boolean = guarded("sendTouch") {
         adapter.sendTouch(event)
-        return true
     }
 
-    fun onKey(event: ProjectionKeyEvent): Boolean {
+    fun onKey(event: ProjectionKeyEvent): Boolean = guarded("sendKey") {
         adapter.sendKey(event)
-        return true
+    }
+
+    private fun guarded(operation: String, block: () -> Unit): Boolean = try {
+        block()
+        true
+    } catch (error: Exception) {
+        diagnostics.event("input-failed", "op=$operation error=${error.javaClass.simpleName}")
+        false
     }
 }
 

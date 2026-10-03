@@ -78,7 +78,9 @@ object ProjectionMediaMapping {
         sampleRate = format.sampleRate,
         channels = format.channels,
         payloadType = format.payloadType,
-        audioType = format.wireType,
+        // Backend-neutral callers leave wireType empty; the channel role then
+        // determines the routing label so nothing depends on Apple wire strings.
+        audioType = format.wireType.ifEmpty { wireTypeFor(format.channel) },
     )
 
     fun toProjectionFormat(format: AudioFormat, channel: ProjectionAudioChannel): ProjectionAudioFormat =

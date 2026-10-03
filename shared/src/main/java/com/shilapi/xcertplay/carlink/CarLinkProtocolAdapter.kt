@@ -1,10 +1,14 @@
 package com.shilapi.xcertplay.carlink
 
+import com.shilapi.xcertplay.projection.ProjectionAudioChannel
+import com.shilapi.xcertplay.projection.ProjectionAudioCodec
 import com.shilapi.xcertplay.projection.ProjectionDevice
 import com.shilapi.xcertplay.projection.ProjectionKeyEvent
 import com.shilapi.xcertplay.projection.ProjectionMetadata
 import com.shilapi.xcertplay.projection.ProjectionTouchEvent
 import com.shilapi.xcertplay.projection.ProjectionTransport
+import com.shilapi.xcertplay.projection.ProjectionVideoConfig
+import com.shilapi.xcertplay.projection.ProjectionVideoFrame
 
 /**
  * One Android phone discovered through an ICCOA CarLink stack.
@@ -29,8 +33,48 @@ data class CarLinkDevice(
 }
 
 /**
+ * Format of one CarLink audio stream, announced by
+ * [CarLinkProtocolListener.onAudioStarted] before its first frame.
+ *
+ * Fully backend-neutral and strongly typed: channel [role] is a
+ * [ProjectionAudioChannel], never a protocol wire string.
+ */
+data class CarLinkAudioFormat(
+    /** Protocol stream number; opaque, unique per open stream in a session. */
+    val streamId: Int,
+    /** Routing role of this stream. */
+    val role: ProjectionAudioChannel,
+    val codec: ProjectionAudioCodec,
+    val sampleRate: Int,
+    val channels: Int,
+    /** Backend wire payload type, kept for diagnostics only. */
+    val payloadType: Int = 0,
+)
+
+/**
+ * One raw audio access unit (or PCM frame) of a CarLink stream.
+ *
+ * The payload is an unframed codec access unit — no transport/RTP framing is
+ * assumed at this boundary. [offset]/[length] delimit the valid window so
+ * adapters can forward buffers without copying.
+ */
+class CarLinkAudioFrame(
+    val streamId: Int,
+    val presentationTimeUs: Long,
+    val payload: ByteArray,
+    val offset: Int = 0,
+    val length: Int = payload.size - offset,
+)
+
+/**
  * Callbacks a [CarLinkProtocolAdapter] uses to push session events upward.
  * All methods may be called on any thread owned by the protocol stack.
+ *
+ * Media surfaces are strongly typed: video uses the neutral
+ * [ProjectionVideoConfig]/[ProjectionVideoFrame] objects (codec, size, PTS,
+ * keyframe flag and payload window all preserved), audio has an explicit
+ * started/frame/stopped lifecycle per stream. No string codec guessing happens
+ * at this boundary.
  */
 interface CarLinkProtocolListener {
     /** A phone was found during discovery. */
@@ -42,14 +86,20 @@ interface CarLinkProtocolListener {
     /** The session ended (peer detach, timeout, explicit disconnect). */
     fun onSessionEnded(reason: String) {}
 
+    /** Out-of-band video configuration record (codec + decoder config). */
+    fun onVideoConfig(config: ProjectionVideoConfig) {}
+
     /** Encoded video access unit; payload is only valid during the call. */
-    fun onVideoFrame(codec: String, keyFrame: Boolean, payload: ByteArray, offset: Int, length: Int) {}
+    fun onVideoFrame(frame: ProjectionVideoFrame) {}
 
-    /** Out-of-band video configuration record. */
-    fun onVideoConfig(codec: String, codecData: ByteArray) {}
+    /** One audio stream opened; frames of [CarLinkAudioFormat.streamId] follow. */
+    fun onAudioStarted(format: CarLinkAudioFormat) {}
 
-    /** Encoded or PCM audio payload for one channel role. */
-    fun onAudioFrame(channel: String, presentationTimeUs: Long, payload: ByteArray) {}
+    /** One audio access unit of an open stream. */
+    fun onAudioFrame(frame: CarLinkAudioFrame) {}
+
+    /** The audio stream [streamId] ended; no further frames will arrive. */
+    fun onAudioStopped(streamId: Int) {}
 
     /** Now-playing / navigation metadata update. */
     fun onMetadata(metadata: ProjectionMetadata) {}
@@ -67,6 +117,12 @@ interface CarLinkProtocolListener {
  * becomes available, implement this interface in a dedicated adapter module
  * (`OfficialCarLinkSdkAdapter`, `NativeCarLinkProtocolAdapter`) and the rest of
  * DiPlay — ProjectionManager, media sinks, UI — works unchanged.
+ *
+ * **Exception boundary**: every method below is called through a guard layer
+ * (`CarLinkController`) that converts thrown exceptions into
+ * `ProjectionState.Error` and cleans up session/resource state. Implementations
+ * may throw; they must never crash a UI or protocol thread by leaking runtime
+ * exceptions past this interface — but even if they do, the guard catches them.
  *
  * Threading mirrors the rest of `shared`: implementations own their workers,
  * calls return quickly, and callbacks arrive on protocol threads.

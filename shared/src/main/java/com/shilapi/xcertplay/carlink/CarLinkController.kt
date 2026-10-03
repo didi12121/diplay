@@ -1,29 +1,37 @@
 package com.shilapi.xcertplay.carlink
 
-import com.shilapi.xcertplay.projection.ProjectionAudioSink
 import com.shilapi.xcertplay.projection.ProjectionDevice
 import com.shilapi.xcertplay.projection.ProjectionLogger
 import com.shilapi.xcertplay.projection.ProjectionMetadata
-import com.shilapi.xcertplay.projection.ProjectionVideoSink
 
 /**
  * Session orchestrator between [CarLinkProtocolAdapter] and the shared media
  * layer. It owns discovery state, the discovered device list, the channels, and
  * the metadata fan-out — but no protocol details. Swap the adapter and the whole
  * controller keeps working.
+ *
+ * Media lifecycle: when a session starts, sinks are acquired from
+ * [CarLinkMediaSinkProvider] and bound to the video/audio channels; when the
+ * session ends (or fails), the channels are unbound and the sinks closed. A
+ * session that never started never holds a decoder or AudioTrack.
+ *
+ * Exception boundary: every call into the adapter is guarded. An adapter that
+ * throws never crashes the caller; the failure surfaces as
+ * [CarLinkSessionEvent.Error] (→ `ProjectionState.Error` with cause retained)
+ * and session/channel state is cleaned up (audio streams stopped, session
+ * inactive, media sinks released).
  */
 class CarLinkController(
     private val adapter: CarLinkProtocolAdapter,
-    videoSink: ProjectionVideoSink,
-    audioSink: ProjectionAudioSink,
+    private val mediaSinks: CarLinkMediaSinkProvider,
     logger: ProjectionLogger = ProjectionLogger.NONE,
     private val backendId: String = CarLinkProjectionBackend.ID,
 ) {
     private val diagnostics = CarLinkDiagnostics(logger, backendId)
 
-    val video = CarLinkVideoChannel(videoSink, diagnostics)
-    val audio = CarLinkAudioChannel(audioSink, diagnostics)
-    val input = CarLinkInputChannel(adapter)
+    val video = CarLinkVideoChannel(diagnostics)
+    val audio = CarLinkAudioChannel(diagnostics)
+    val input = CarLinkInputChannel(adapter, diagnostics)
     val metadata = CarLinkMetadataChannel()
 
     private val discovered = java.util.concurrent.CopyOnWriteArrayList<CarLinkDevice>()
@@ -31,6 +39,10 @@ class CarLinkController(
         java.util.concurrent.CopyOnWriteArrayList<(List<ProjectionDevice>) -> Unit>()
     private val sessionListeners =
         java.util.concurrent.CopyOnWriteArrayList<(CarLinkSessionEvent) -> Unit>()
+
+    /** Sinks of the active session, closed when it ends. */
+    @Volatile
+    private var sessionMedia: CarLinkMediaSinks? = null
 
     @Volatile
     var currentDevice: CarLinkDevice? = null
@@ -74,24 +86,26 @@ class CarLinkController(
             diagnostics.event("provider-unavailable")
             return
         }
-        adapter.initialize()
-        diagnostics.event("initialize", "provider=${adapter.providerName}")
+        guarded("initialize") {
+            adapter.initialize()
+            diagnostics.event("initialize", "provider=${adapter.providerName}")
+        }
     }
 
     fun startDiscovery() {
         if (!adapter.isAvailable) return
         discovered.clear()
         diagnostics.event("discovering")
-        adapter.startDiscovery()
+        guarded("startDiscovery") { adapter.startDiscovery() }
     }
 
     fun stopDiscovery() {
-        adapter.stopDiscovery()
+        guarded("stopDiscovery") { adapter.stopDiscovery() }
     }
 
     fun connect(device: ProjectionDevice?) {
         if (!adapter.isAvailable) {
-            emit(CarLinkSessionEvent.Error("PROVIDER_UNAVAILABLE", "CarLink protocol provider unavailable"))
+            emit(CarLinkSessionEvent.Error("PROVIDER_UNAVAILABLE", CarLinkProjectionBackend.PROVIDER_UNAVAILABLE_MESSAGE))
             return
         }
         val target = device?.let { projection ->
@@ -102,23 +116,68 @@ class CarLinkController(
             return
         }
         diagnostics.event("connecting", "device=${target.deviceId}")
-        adapter.connect(target)
+        guarded("connect") { adapter.connect(target) }
     }
 
     fun disconnect() {
-        adapter.disconnect()
+        guarded("disconnect") { adapter.disconnect() }
     }
 
     fun dispose() {
-        adapter.dispose()
-        discovered.clear()
-        sessionActive = false
-        currentDevice = null
+        try {
+            guarded("dispose") { adapter.dispose() }
+        } finally {
+            teardownSession("dispose")
+            discovered.clear()
+        }
     }
 
     fun onMetadata(listener: (ProjectionMetadata) -> Unit) = metadata.addListener(listener)
 
     fun offMetadata(listener: (ProjectionMetadata) -> Unit) = metadata.removeListener(listener)
+
+    /** Runs an adapter call; failures become session errors, never exceptions. */
+    private fun guarded(operation: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (error: Exception) {
+            diagnostics.event(
+                "adapter-failed",
+                "op=$operation error=${error.javaClass.simpleName}",
+            )
+            teardownSession(operation)
+            emit(
+                CarLinkSessionEvent.Error(
+                    code = "ADAPTER_FAILURE",
+                    message = "CarLink adapter $operation failed: ${error.javaClass.simpleName}",
+                    cause = error,
+                ),
+            )
+        }
+    }
+
+    /** Clears session and channel state after a session ends or fails. */
+    private fun teardownSession(reason: String) {
+        val wasActive = sessionActive
+        sessionActive = false
+        currentDevice = null
+        audio.stopAll()
+        video.onActive(false)
+        video.unbind()
+        audio.unbind()
+        val media = sessionMedia
+        sessionMedia = null
+        if (media != null) {
+            try {
+                media.close()
+            } catch (error: Exception) {
+                diagnostics.event("media-close-failed", "error=${error.javaClass.simpleName}")
+            }
+        }
+        if (wasActive) {
+            diagnostics.event("session-torn-down", "reason=${CarLinkDiagnostics.redact(reason)}")
+        }
+    }
 
     private fun emit(event: CarLinkSessionEvent) {
         for (listener in sessionListeners) listener(event)
@@ -128,7 +187,10 @@ class CarLinkController(
         override fun onDeviceFound(device: CarLinkDevice) {
             if (discovered.none { it.deviceId == device.deviceId }) {
                 discovered.add(device)
-                diagnostics.event("device-found", "device=${device.deviceId} vendor=${device.vendorHint ?: "unknown"}")
+                diagnostics.event(
+                    "device-found",
+                    "device=${device.deviceId} vendor=${device.vendorHint ?: "unknown"}",
+                )
             }
             val snapshot = discoveredDevices()
             for (listener in deviceListeners) listener(snapshot)
@@ -138,34 +200,51 @@ class CarLinkController(
             currentDevice = device
             sessionActive = true
             diagnostics.event("connected", "device=${device.deviceId}")
+            val media = try {
+                mediaSinks.acquire()
+            } catch (error: Exception) {
+                diagnostics.event("media-acquire-failed", "error=${error.javaClass.simpleName}")
+                teardownSession("media-acquire-failed")
+                emit(
+                    CarLinkSessionEvent.Error(
+                        "ADAPTER_FAILURE",
+                        "media sink acquisition failed: ${error.javaClass.simpleName}",
+                        error,
+                    ),
+                )
+                return
+            }
+            sessionMedia = media
+            video.bind(media.video)
+            audio.bind(media.audio)
             video.onActive(true)
             emit(CarLinkSessionEvent.Connected(device.toProjectionDevice(backendId)))
         }
 
         override fun onSessionEnded(reason: String) {
-            sessionActive = false
-            video.onActive(false)
+            teardownSession(reason)
             diagnostics.event("disconnected", "reason=${CarLinkDiagnostics.redact(reason)}")
             emit(CarLinkSessionEvent.Disconnected(CarLinkDiagnostics.redact(reason)))
-            currentDevice = null
         }
 
-        override fun onVideoFrame(codec: String, keyFrame: Boolean, payload: ByteArray, offset: Int, length: Int) {
-            video.onFrame(codec, keyFrame, payload, offset, length)
+        override fun onVideoConfig(config: com.shilapi.xcertplay.projection.ProjectionVideoConfig) {
+            video.onConfig(config)
         }
 
-        override fun onVideoConfig(codec: String, codecData: ByteArray) {
-            video.onConfig(codec, codecData)
+        override fun onVideoFrame(frame: com.shilapi.xcertplay.projection.ProjectionVideoFrame) {
+            video.onFrame(frame)
         }
 
-        override fun onAudioFrame(channel: String, presentationTimeUs: Long, payload: ByteArray) {
-            val role = when (channel.lowercase()) {
-                "media", "music" -> com.shilapi.xcertplay.projection.ProjectionAudioChannel.MEDIA
-                "navigation", "nav", "guidance" -> com.shilapi.xcertplay.projection.ProjectionAudioChannel.NAVIGATION
-                "call", "phone", "telephony" -> com.shilapi.xcertplay.projection.ProjectionAudioChannel.PHONE_CALL
-                else -> com.shilapi.xcertplay.projection.ProjectionAudioChannel.VOICE_ASSISTANT
-            }
-            audio.frame(role, presentationTimeUs, payload)
+        override fun onAudioStarted(format: CarLinkAudioFormat) {
+            audio.start(format)
+        }
+
+        override fun onAudioFrame(frame: CarLinkAudioFrame) {
+            audio.frame(frame)
+        }
+
+        override fun onAudioStopped(streamId: Int) {
+            audio.stop(streamId)
         }
 
         override fun onMetadata(metadata: ProjectionMetadata) {
@@ -174,7 +253,7 @@ class CarLinkController(
 
         override fun onError(code: String, message: String, cause: Throwable?) {
             diagnostics.event("error", "code=$code message=${CarLinkDiagnostics.redact(message)}")
-            emit(CarLinkSessionEvent.Error(code, CarLinkDiagnostics.redact(message)))
+            emit(CarLinkSessionEvent.Error(code, CarLinkDiagnostics.redact(message), cause))
         }
     }
 }
@@ -183,5 +262,9 @@ class CarLinkController(
 sealed class CarLinkSessionEvent {
     data class Connected(val device: ProjectionDevice) : CarLinkSessionEvent()
     data class Disconnected(val reason: String) : CarLinkSessionEvent()
-    data class Error(val code: String, val message: String) : CarLinkSessionEvent()
+    data class Error(
+        val code: String,
+        val message: String,
+        val cause: Throwable? = null,
+    ) : CarLinkSessionEvent()
 }
