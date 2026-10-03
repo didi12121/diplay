@@ -33,6 +33,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.shilapi.xcertplay.airplay.CarPlayClusterDisplay
+import com.shilapi.xcertplay.carlink.CarLinkProjectionBackend
 import com.shilapi.xcertplay.hud.BydAdbAccess
 import com.shilapi.xcertplay.hud.BydNavigationOutputs
 import com.shilapi.xcertplay.hud.BydOutputSettings
@@ -131,6 +132,7 @@ class DiPlayActivity : ComponentActivity() {
                 else -> ProjectionMode.AUTO
             },
         )
+        ProjectionHost.manager.addStateListener(projectionSessionLauncher)
         render()
         handleWirelessRecovery()
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -183,6 +185,13 @@ class DiPlayActivity : ComponentActivity() {
         }
     }
     override fun onPause() { handler.removeCallbacks(tick); super.onPause() }
+
+    override fun onDestroy() {
+        ProjectionHost.manager.removeStateListener(projectionSessionLauncher)
+        mockPattern?.close()
+        mockPattern = null
+        super.onDestroy()
+    }
 
     private fun render() {
         status = null; connectButton = null; disconnectButton = null; lastRunning = null
@@ -612,7 +621,7 @@ class DiPlayActivity : ComponentActivity() {
             }
         }
 
-        val backend = ProjectionHost.registerCarLink()
+        val backend = ProjectionHost.registerCarLink(context = applicationContext)
         section(content, getString(R.string.carlink_framework)) { card ->
             carLinkStatus = label("", 20, TEXT, true).apply { setPadding(0, dp(4), 0, dp(12)) }
             card.addView(carLinkStatus)
@@ -648,7 +657,59 @@ class DiPlayActivity : ComponentActivity() {
             carLinkDiscoverButton?.isEnabled = available
             carLinkConnectButton?.isEnabled = available
             carLinkDisconnectButton?.isEnabled = available
+            // Developer-only mock entry (debug builds): drives the real
+            // rendering pipeline with a generated H.264 test pattern and a PCM
+            // tone so a developer can verify Surface/MediaCodec/AudioTrack end
+            // to end. Never present in a release APK.
+            if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+                card.addView(button("Developer: mock session (test pattern + tone)", false) {
+                    startMockCarLinkSession(backend)
+                }, matchButton(10, 60))
+            }
         }
+        refreshCarLinkPanel()
+    }
+
+    /**
+     * Debug-only harness: registers the mock protocol adapter and streams a
+     * real H.264 test pattern + PCM tone through the shared media pipeline.
+     */
+    private var mockPattern: com.shilapi.xcertplay.carlink.MockCarLinkTestPattern? = null
+
+    /** Auto-enter the projection host page when a CarLink session connects. */
+    private val projectionSessionLauncher = ProjectionStateListener { backendId, state ->
+        if (backendId == CarLinkProjectionBackend.ID && state == ProjectionState.Connected) {
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) {
+                    startActivity(Intent(this, ProjectionSessionActivity::class.java))
+                }
+            }
+        }
+    }
+
+    private fun startMockCarLinkSession(current: CarLinkProjectionBackend) {
+        val adapter = com.shilapi.xcertplay.carlink.MockCarLinkProtocolAdapter()
+        val backend = ProjectionHost.registerCarLinkMock(
+            mediaSinks = com.shilapi.xcertplay.carlink.AndroidCarLinkMediaSinkProvider(
+                ProjectionHost.display,
+                applicationContext,
+            ),
+            adapter = adapter,
+        )
+        backend.initialize()
+        backend.start()
+        val device = backend.discoveredDevices().firstOrNull()
+        ProjectionHost.manager.select(ProjectionMode.CARLINK)
+        if (device != null) {
+            try {
+                ProjectionHost.manager.connect(device)
+            } catch (conflict: ProjectionResourceConflictException) {
+                toast(getString(R.string.carlink_resource_busy))
+                return
+            }
+        }
+        mockPattern?.close()
+        mockPattern = com.shilapi.xcertplay.carlink.MockCarLinkTestPattern(adapter).also { it.start() }
         refreshCarLinkPanel()
     }
 

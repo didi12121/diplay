@@ -176,6 +176,31 @@ class MockCarLinkProtocolAdapter(
         listener?.onAudioStopped(streamId)
     }
 
+    /** Test hook: pushes a typed video config (developer harnesses). */
+    fun simulateVideoConfig(config: ProjectionVideoConfig) {
+        listener?.onVideoConfig(config)
+    }
+
+    /** Test hook: pushes a typed video frame (developer harnesses). */
+    fun simulateVideoFrame(frame: ProjectionVideoFrame) {
+        listener?.onVideoFrame(frame)
+    }
+
+    /** Test hook: opens a typed audio stream (developer harnesses). */
+    fun simulateAudioStarted(format: CarLinkAudioFormat) {
+        listener?.onAudioStarted(format)
+    }
+
+    /** Test hook: pushes one raw audio access unit (developer harnesses). */
+    fun simulateAudioFrame(frame: CarLinkAudioFrame) {
+        listener?.onAudioFrame(frame)
+    }
+
+    /** Test hook: closes a typed audio stream (developer harnesses). */
+    fun simulateAudioStopped(streamId: Int) {
+        listener?.onAudioStopped(streamId)
+    }
+
     /** Test hook: pushes a fake session end through the listener. */
     fun simulateSessionEnd(reason: String) {
         val device = connected ?: return
