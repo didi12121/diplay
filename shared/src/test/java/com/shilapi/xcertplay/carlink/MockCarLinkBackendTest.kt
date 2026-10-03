@@ -30,7 +30,13 @@ class MockCarLinkBackendTest {
     private fun keyEvent() = ProjectionKeyEvent(ProjectionKeyAction.DOWN, ProjectionKeyCode.VOICE_ASSISTANT)
 
     private fun backendOf(adapter: CarLinkProtocolAdapter): CarLinkProjectionBackend =
-        CarLinkProjectionBackend(adapter)
+        CarLinkProjectionBackend(
+            adapter = adapter,
+            mediaSinks = StaticCarLinkMediaSinkProvider(
+                com.shilapi.xcertplay.projection.ProjectionVideoSink.NOOP,
+                com.shilapi.xcertplay.projection.ProjectionAudioSink.NOOP,
+            ),
+        )
 
     @Test
     fun mockAdapterListsEcosystemDevices() {
@@ -55,7 +61,7 @@ class MockCarLinkBackendTest {
         backend.initialize()
         backend.start()
         assertTrue(states.contains(ProjectionState.Discovering))
-        assertEquals(3, backend.discoveredDevices.size)
+        assertEquals(3, backend.discoveredDevices().size)
     }
 
     @Test

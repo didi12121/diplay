@@ -129,7 +129,8 @@ class ProjectionMediaMappingTest {
                 payload = payload,
             ),
         )
-        assertEquals(listOf(VideoCodec.H265, VideoCodec.H265), sink.videoCodecs)
+        // Codec is announced once with the config, not per frame.
+        assertEquals(listOf(VideoCodec.H265), sink.videoCodecs)
         assertArrayEquals(byteArrayOf(9, 9), sink.videoConfigs.single())
         // Whole-buffer windows must be forwarded by reference, not copied.
         assertSame(payload, sink.videoFrames.single())

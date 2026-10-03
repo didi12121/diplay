@@ -3310,23 +3310,33 @@ class CarPlayHostActivity : ComponentActivity() {
         // Register the CarPlay backend with the projection host so UI and future
         // backends (CarLink...) see one unified state machine. The controller is
         // wrapped, not driven: CarPlay lifecycle stays exactly as before.
-        ProjectionHost.manager.register(
-            CarPlayProjectionBackend.wrapping(
-                controller = next,
-                logger = ProjectionLogger.ANDROID,
-                transport = if (config.transport == CarPlayTransport.WIRELESS) {
-                    ProjectionTransport.WIFI
-                } else {
-                    ProjectionTransport.USB
-                },
-            ),
+        val carPlayBackend = CarPlayProjectionBackend.wrapping(
+            controller = next,
+            logger = ProjectionLogger.ANDROID,
+            transport = if (config.transport == CarPlayTransport.WIRELESS) {
+                ProjectionTransport.WIFI
+            } else {
+                ProjectionTransport.USB
+            },
         )
-        // Claim the shared hardware for this session; a conflicting backend
-        // (e.g. an active CarLink mock session) is released first because USB
-        // CarPlay attach must win.
-        ProjectionHost.manager.releaseBackend(com.shilapi.xcertplay.carlink.CarLinkProjectionBackend.ID)
-        runCatching { ProjectionHost.manager.claim(CarPlayProjectionBackend.ID) }
-            .onFailure { Log.w(TAG, "projection resource claim failed: ${it.javaClass.simpleName}") }
+        // Host lifecycle hook: a projection-level takeover asks us to stop the
+        // externally-owned CarPlay session; run the real shutdown and then
+        // confirm the stop so the manager releases shared resources only after
+        // the controller has actually closed.
+        carPlayBackend.hostStopHandler = {
+            mainHandler.post {
+                shutdown(terminateProcess = false, reason = "projection takeover") {
+                    carPlayBackend.notifySessionStopped()
+                }
+            }
+        }
+        ProjectionHost.manager.register(carPlayBackend)
+        // USB CarPlay attach wins over an old CarLink session via the explicit
+        // takeover path: request its stop, wait for the real stop confirmation,
+        // then claim the shared hardware.
+        runCatching {
+            ProjectionHost.manager.takeover(CarPlayProjectionBackend.ID, null)
+        }.onFailure { Log.w(TAG, "projection takeover failed: ${it.javaClass.simpleName}") }
         CarPlayMediaKeys.attach(this, next)
         if (airPlayConfig.videoInCar) CarPlayVideo.attach(this, next)
         val display = CarPlaySessionDisplay(airPlayConfig.main.widthPixels, airPlayConfig.main.heightPixels,
@@ -3612,8 +3622,9 @@ class CarPlayHostActivity : ComponentActivity() {
         val oldSink = sink
         CarPlayMediaKeys.detach(oldController)
         CarPlayBackgroundSession.clear(oldController)
-        // Release the projection backend's shared hardware claims (audio, mic,
-        // USB/Wi-Fi) so another backend can acquire them.
+        // Selection/unregistration alone must NOT release shared hardware while
+        // the session is still running; the teardown below confirms the real
+        // stop and only then releases the projection backend's claims.
         ProjectionHost.manager.unregister(CarPlayProjectionBackend.ID)
         controller = null
         sink = null
@@ -3622,6 +3633,9 @@ class CarPlayHostActivity : ComponentActivity() {
         teardownExecutor.execute {
             oldController?.close()
             val clean = oldController?.awaitClosed(CONTROLLER_CLOSE_TIMEOUT_MILLIS) ?: true
+            // The CarPlay session is actually stopped now: release USB/Wi-Fi,
+            // audio and microphone claims so another backend may acquire them.
+            ProjectionHost.manager.onBackendSessionStopped(CarPlayProjectionBackend.ID)
             oldSink?.close()
             airPlayCommandExecutor.shutdown()
             if (terminateProcess) {

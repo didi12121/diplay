@@ -7,10 +7,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 
-/** Backend registration and switching for [ProjectionManager]. */
+/** Backend registration, selection and switching for [ProjectionManager]. */
 class ProjectionManagerTest {
 
-    private class FakeBackend(
+    internal open class FakeBackend(
         override val id: String,
         override val requiredResources: Set<ProjectionResource> = emptySet(),
     ) : ProjectionBackend {
@@ -23,6 +23,12 @@ class ProjectionManagerTest {
         var stopCount = 0
         var connectDevice: ProjectionDevice? = null
 
+        /** Simulates the underlying protocol session actually running. */
+        var sessionActive: Boolean = false
+
+        override val isSessionActive: Boolean
+            get() = sessionActive
+
         override fun addStateListener(listener: ProjectionStateListener) = stateStore.addListener(listener)
         override fun removeStateListener(listener: ProjectionStateListener) = stateStore.removeListener(listener)
         override fun initialize() {}
@@ -31,12 +37,15 @@ class ProjectionManagerTest {
         override fun connect(device: ProjectionDevice?) {
             connectCount += 1
             connectDevice = device
+            sessionActive = true
             stateStore.publish(ProjectionState.Connected)
         }
 
-        override fun disconnect() {
+        override fun disconnect(): Boolean {
             disconnectCount += 1
+            sessionActive = false
             stateStore.publish(ProjectionState.Idle)
+            return true
         }
 
         override fun onTouchEvent(event: ProjectionTouchEvent) = true
@@ -90,19 +99,21 @@ class ProjectionManagerTest {
         assertEquals("carlink", manager.activeBackend?.id)
     }
 
-    @Test fun switchingBackendDisconnectsThePreviousOne() {
+    @Test fun selectDoesNotStopThePreviousBackend() {
         val manager = ProjectionManager()
-        val carPlay = FakeBackend("carplay")
+        val carPlay = FakeBackend("carplay", setOf(ProjectionResource.USB, ProjectionResource.AUDIO))
         val carLink = FakeBackend("carlink")
         manager.register(carPlay)
         manager.register(carLink)
         manager.select(ProjectionMode.CARPLAY)
         manager.connect(null)
-        assertEquals(1, carPlay.connectCount)
+        assertTrue(carPlay.sessionActive)
+        // Selection is preference only: the live session and its resources are
+        // untouched — releasing them requires an actual stop.
         manager.select(ProjectionMode.CARLINK)
-        // Switching deactivates the previous backend and releases its resources.
-        assertEquals(1, carPlay.disconnectCount)
-        assertEquals("carlink", manager.activeBackend?.id)
+        assertEquals(0, carPlay.disconnectCount)
+        assertTrue(carPlay.sessionActive)
+        assertEquals(setOf(ProjectionResource.USB, ProjectionResource.AUDIO), manager.resourcesHeldBy("carplay"))
     }
 
     @Test fun disconnectReleasesResourcesOfTheActiveBackend() {
@@ -111,7 +122,7 @@ class ProjectionManagerTest {
         manager.register(carLink)
         manager.connect(null)
         assertEquals(setOf(ProjectionResource.USB, ProjectionResource.AUDIO), manager.resourcesHeldBy("carlink"))
-        manager.disconnect()
+        assertTrue(manager.disconnect())
         assertTrue(manager.resourcesHeldBy("carlink").isEmpty())
         assertEquals(1, carLink.disconnectCount)
     }

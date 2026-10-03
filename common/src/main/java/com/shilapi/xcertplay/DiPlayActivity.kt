@@ -642,6 +642,12 @@ class DiPlayActivity : ComponentActivity() {
                 refreshCarLinkPanel()
             }
             card.addView(carLinkDisconnectButton, matchButton(10, 60))
+            // No protocol provider (no official SDK): nothing to discover or
+            // connect — say so honestly instead of offering dead buttons.
+            val available = backend.carLink.available
+            carLinkDiscoverButton?.isEnabled = available
+            carLinkConnectButton?.isEnabled = available
+            carLinkDisconnectButton?.isEnabled = available
         }
         refreshCarLinkPanel()
     }
@@ -650,8 +656,9 @@ class DiPlayActivity : ComponentActivity() {
     private fun refreshCarLinkPanel() {
         val backend = ProjectionHost.carLinkBackend ?: return
         val state = backend.state
+        val providerAvailable = backend.carLink.available
         val statusText = when {
-            !backend.carLink.available -> getString(R.string.carlink_status_no_provider)
+            !providerAvailable -> getString(R.string.carlink_status_no_provider)
             state is ProjectionState.Error ->
                 if (state.code == ProjectionErrorCode.PROVIDER_UNAVAILABLE) {
                     getString(R.string.carlink_status_no_provider)
@@ -668,11 +675,11 @@ class DiPlayActivity : ComponentActivity() {
             else -> getString(R.string.carlink_status_disabled)
         }
         carLinkStatus?.text = "${getString(R.string.carlink_status_label)}: $statusText"
-        val devices = backend.discoveredDevices
-        carLinkDevices?.text = if (devices.isEmpty()) {
-            getString(R.string.carlink_status_waiting)
-        } else {
-            devices.joinToString("\n") { device: ProjectionDevice ->
+        val devices = backend.discoveredDevices()
+        carLinkDevices?.text = when {
+            !providerAvailable -> getString(R.string.carlink_status_no_provider)
+            devices.isEmpty() -> getString(R.string.carlink_status_waiting)
+            else -> devices.joinToString("\n") { device: ProjectionDevice ->
                 "${device.name}${device.vendorHint?.let { " · $it" } ?: ""}"
             }
         }
