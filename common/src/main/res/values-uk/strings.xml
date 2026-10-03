@@ -479,4 +479,26 @@
     <string name="widget_minutes">%1$d хв</string>
     <string name="widget_no_route">Немає маршруту</string>
     <string name="widget_not_connected">CarPlay не підключено</string>
+    <string name="phone_projection">Трансляція з телефона</string>
+    <string name="connection_method">Спосіб підключення</string>
+    <string name="method_auto">Авто</string>
+    <string name="method_carplay">Apple CarPlay</string>
+    <string name="method_carlink">Android CarLink</string>
+    <string name="carlink_framework">Фреймворк CarLink (експериментальний)</string>
+    <string name="carlink_status_label">Стан</string>
+    <string name="carlink_status_disabled">Не ввімкнено</string>
+    <string name="carlink_status_no_provider">Провайдер протоколу CarLink недоступний</string>
+    <string name="carlink_status_discovering">Пошук пристроїв</string>
+    <string name="carlink_status_waiting">Очікування пристрою</string>
+    <string name="carlink_status_connecting">Підключення</string>
+    <string name="carlink_status_connected">Підключено</string>
+    <string name="carlink_status_error">Помилка</string>
+    <string name="carlink_supported">Цілі фреймворку: Xiaomi CarWith, vivo Jovi InCar, OPPO Car+ через ICCOA CarLink</string>
+    <string name="carlink_not_verified">CarLink — експериментальна функція; сумісність із реальними телефонами ще не перевірена</string>
+    <string name="carlink_discover">Знайти пристрої</string>
+    <string name="carlink_connect">Підключити</string>
+    <string name="carlink_disconnect">Відключити</string>
+    <string name="carlink_devices">Пристрої</string>
+    <string name="carlink_resource_busy">Інша сесія трансляції використовує спільне обладнання. Спочатку відключіть її.</string>
+    <string name="carlink_status_disconnecting">Відключення</string>
 </resources>

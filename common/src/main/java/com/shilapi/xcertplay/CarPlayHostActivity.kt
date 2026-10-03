@@ -80,6 +80,13 @@ import com.shilapi.xcertplay.orchestration.ManualHotspotSecurity
 import com.shilapi.xcertplay.orchestration.MfiTarget
 import com.shilapi.xcertplay.orchestration.WirelessHotspotMode
 import com.shilapi.xcertplay.orchestration.isManualHotspotChannelCompatible
+import com.shilapi.xcertplay.projection.ProjectionDisplayGeometry
+import com.shilapi.xcertplay.projection.ProjectionHost
+import com.shilapi.xcertplay.projection.ProjectionLogger
+import com.shilapi.xcertplay.projection.ProjectionRect
+import com.shilapi.xcertplay.projection.ProjectionTouchEvents
+import com.shilapi.xcertplay.projection.ProjectionTransport
+import com.shilapi.xcertplay.projection.carplay.CarPlayProjectionBackend
 import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
 import com.shilapi.xcertplay.transport.Iap2LocationProvider
 import com.shilapi.xcertplay.transport.UsbDeviceId
@@ -3155,6 +3162,8 @@ class CarPlayHostActivity : ComponentActivity() {
     private fun createStatusReporter(
         controllerGeneration: Int,
     ): (CarPlayStatus) -> Unit = { status ->
+        // Mirror CarPlay status into the unified projection state machine.
+        ProjectionHost.carPlayBackend?.acceptStatus(status)
         if (!menuOpen && controllerGeneration == restartGeneration) {
             updateHotspotStatus(status)
             val description = status.describe()
@@ -3181,6 +3190,11 @@ class CarPlayHostActivity : ComponentActivity() {
         controller = snapshot.controller
         sink = snapshot.sink
         sessionDisplay = snapshot.display
+        // Re-wrap the adopted controller so the projection host keeps pointing at
+        // the live CarPlay session.
+        ProjectionHost.manager.register(
+            CarPlayProjectionBackend.wrapping(snapshot.controller, ProjectionLogger.ANDROID),
+        )
         MapMirrors.reapply()
         CarPlayBackgroundSession.store(snapshot.controller, snapshot.sink, snapshot.width, snapshot.height,
             this, snapshot.display) { completion ->
@@ -3293,6 +3307,26 @@ class CarPlayHostActivity : ComponentActivity() {
             },
         )
         controller = next
+        // Register the CarPlay backend with the projection host so UI and future
+        // backends (CarLink...) see one unified state machine. The controller is
+        // wrapped, not driven: CarPlay lifecycle stays exactly as before.
+        ProjectionHost.manager.register(
+            CarPlayProjectionBackend.wrapping(
+                controller = next,
+                logger = ProjectionLogger.ANDROID,
+                transport = if (config.transport == CarPlayTransport.WIRELESS) {
+                    ProjectionTransport.WIFI
+                } else {
+                    ProjectionTransport.USB
+                },
+            ),
+        )
+        // Claim the shared hardware for this session; a conflicting backend
+        // (e.g. an active CarLink mock session) is released first because USB
+        // CarPlay attach must win.
+        ProjectionHost.manager.releaseBackend(com.shilapi.xcertplay.carlink.CarLinkProjectionBackend.ID)
+        runCatching { ProjectionHost.manager.claim(CarPlayProjectionBackend.ID) }
+            .onFailure { Log.w(TAG, "projection resource claim failed: ${it.javaClass.simpleName}") }
         CarPlayMediaKeys.attach(this, next)
         if (airPlayConfig.videoInCar) CarPlayVideo.attach(this, next)
         val display = CarPlaySessionDisplay(airPlayConfig.main.widthPixels, airPlayConfig.main.heightPixels,
@@ -3578,6 +3612,9 @@ class CarPlayHostActivity : ComponentActivity() {
         val oldSink = sink
         CarPlayMediaKeys.detach(oldController)
         CarPlayBackgroundSession.clear(oldController)
+        // Release the projection backend's shared hardware claims (audio, mic,
+        // USB/Wi-Fi) so another backend can acquire them.
+        ProjectionHost.manager.unregister(CarPlayProjectionBackend.ID)
         controller = null
         sink = null
         sessionDisplay = null
@@ -3667,8 +3704,20 @@ class CarPlayHostActivity : ComponentActivity() {
             }
             return true
         }
-        val contacts = CarPlayTouchMapper.contacts(event, content)
-        val queued = controller?.sendTouch(contacts) ?: false
+        // Unified input path: Android touch -> ProjectionTouchEvent -> active
+        // backend -> CarPlay HID. CarPlayInputAdapter applies the same
+        // normalization CarPlayTouchMapper used, so behavior is unchanged.
+        val geometry = ProjectionDisplayGeometry(
+            screenWidth = view.width,
+            screenHeight = view.height,
+            contentRect = ProjectionRect(content.left, content.top, content.width, content.height),
+        )
+        val backend = ProjectionHost.carPlayBackend
+        val queued = if (backend != null) {
+            backend.onTouchEvent(ProjectionTouchEvents.from(event, geometry))
+        } else {
+            controller?.sendTouch(CarPlayTouchMapper.contacts(event, content)) ?: false
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN,
             MotionEvent.ACTION_POINTER_DOWN,

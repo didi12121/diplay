@@ -467,4 +467,26 @@
     <string name="center_map_no_permission_screen">На этом головном устройстве нет экрана настроек для этого разрешения. Разрешите его через ADB.</string>
     <string name="launcher_map_sharing">Делиться живой картой с другими лаунчерами</string>
     <string name="launcher_map_sharing_description">Лаунчеры с поддержкой DiPlay смогут показывать живую карту приборной панели на своём главном экране. Выключено по умолчанию, потому что тогда карту сможет запросить любое приложение на головном устройстве. Подробнее: docs/LAUNCHER_INTEGRATION.md.</string>
+    <string name="phone_projection">Трансляция с телефона</string>
+    <string name="connection_method">Способ подключения</string>
+    <string name="method_auto">Авто</string>
+    <string name="method_carplay">Apple CarPlay</string>
+    <string name="method_carlink">Android CarLink</string>
+    <string name="carlink_framework">Фреймворк CarLink (экспериментальный)</string>
+    <string name="carlink_status_label">Состояние</string>
+    <string name="carlink_status_disabled">Не включено</string>
+    <string name="carlink_status_no_provider">Провайдер протокола CarLink недоступен</string>
+    <string name="carlink_status_discovering">Поиск устройств</string>
+    <string name="carlink_status_waiting">Ожидание устройства</string>
+    <string name="carlink_status_connecting">Подключение</string>
+    <string name="carlink_status_connected">Подключено</string>
+    <string name="carlink_status_error">Ошибка</string>
+    <string name="carlink_supported">Цели фреймворка: Xiaomi CarWith, vivo Jovi InCar, OPPO Car+ через ICCOA CarLink</string>
+    <string name="carlink_not_verified">CarLink — экспериментальная функция; совместимость с реальными телефонами ещё не проверена</string>
+    <string name="carlink_discover">Найти устройства</string>
+    <string name="carlink_connect">Подключить</string>
+    <string name="carlink_disconnect">Отключить</string>
+    <string name="carlink_devices">Устройства</string>
+    <string name="carlink_resource_busy">Другая сессия трансляции использует общее оборудование. Сначала отключите её.</string>
+    <string name="carlink_status_disconnecting">Отключение</string>
 </resources>

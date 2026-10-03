@@ -59,4 +59,10 @@ internal object DiPlayPreferences {
     fun saveAutoConnect(context: Context, value: Boolean) {
         prefs(context).edit().putBoolean("auto_connect", value).apply()
     }
+    /** Projection connection method: `auto`, `carplay` or `carlink`. */
+    fun projectionMethod(context: Context): String =
+        prefs(context).getString("projection_method", "auto") ?: "auto"
+    fun saveProjectionMethod(context: Context, value: String) {
+        prefs(context).edit().putString("projection_method", value).apply()
+    }
 }

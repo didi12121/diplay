@@ -38,6 +38,14 @@ import com.shilapi.xcertplay.hud.BydNavigationOutputs
 import com.shilapi.xcertplay.hud.BydOutputSettings
 import com.shilapi.xcertplay.host.R
 import com.shilapi.xcertplay.orchestration.WirelessHotspotMode
+import com.shilapi.xcertplay.projection.ProjectionDevice
+import com.shilapi.xcertplay.projection.ProjectionErrorCode
+import com.shilapi.xcertplay.projection.ProjectionHost
+import com.shilapi.xcertplay.projection.ProjectionManager
+import com.shilapi.xcertplay.projection.ProjectionMode
+import com.shilapi.xcertplay.projection.ProjectionResourceConflictException
+import com.shilapi.xcertplay.projection.ProjectionState
+import com.shilapi.xcertplay.projection.ProjectionStateListener
 import com.shilapi.xcertplay.transport.EvChargingConnectors
 import java.io.File
 import java.text.SimpleDateFormat
@@ -58,6 +66,12 @@ class DiPlayActivity : ComponentActivity() {
     private var pendingWireless = false
     private var initialLaunch = true
     private var notificationTransport = true
+    // CarLink (Android projection) panel state.
+    private var carLinkStatus: TextView? = null
+    private var carLinkDevices: TextView? = null
+    private var carLinkDiscoverButton: Button? = null
+    private var carLinkConnectButton: Button? = null
+    private var carLinkDisconnectButton: Button? = null
     private var exportInProgress = false
     private var navigationStreamType = 14
     private var testToneTrack: AudioTrack? = null
@@ -69,7 +83,11 @@ class DiPlayActivity : ComponentActivity() {
         connect(notificationTransport)
     }
     private val tick = object : Runnable {
-        override fun run() { refreshStatus(); handler.postDelayed(this, 1000) }
+        override fun run() {
+            refreshStatus()
+            if (page == "carlink") refreshCarLinkPanel()
+            handler.postDelayed(this, 1000)
+        }
     }
     private val bluetoothPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) choosePhone() else permissionHelp(getString(R.string.nearby_devices), getString(R.string.allow_nearby_devices_so_diplay_can_connect_to_your_paired))
@@ -106,6 +124,13 @@ class DiPlayActivity : ComponentActivity() {
         }
         pendingCarHotspotSetup = savedInstanceState?.getBoolean("pending_car_hotspot") ?: false
         page = savedInstanceState?.getString("page") ?: intent.getStringExtra("page") ?: "home"
+        ProjectionHost.manager.select(
+            when (DiPlayPreferences.projectionMethod(this)) {
+                "carplay" -> ProjectionMode.CARPLAY
+                "carlink" -> ProjectionMode.CARLINK
+                else -> ProjectionMode.AUTO
+            },
+        )
         render()
         handleWirelessRecovery()
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -177,6 +202,7 @@ class DiPlayActivity : ComponentActivity() {
             "connection" -> connectionSetup(content)
             "settings" -> settings(content)
             "about" -> about(content)
+            "carlink" -> carlinkPanel(content)
             else -> home(content)
         }
         setContentView(scroll)
@@ -227,6 +253,8 @@ class DiPlayActivity : ComponentActivity() {
         }
         right.addView(button(getString(R.string.connect_with_usb), false) { connect(false) }, matchButton())
         right.addView(label(getString(R.string.plug_your_iphone_into_a_usb_data_port_allow_carplay_when_y), 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(24)) })
+        right.addView(button(getString(R.string.phone_projection), false) { page = "carlink"; render() }, matchButton())
+        right.addView(label(getString(R.string.carlink_framework), 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(24)) })
         right.addView(button(getString(R.string.settings), false) { page = "settings"; render() }, matchButton())
         right.addView(label(getString(R.string.make_diplay_feel_right_for_your_car), 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(0, dp(10), 0, dp(24)) })
         right.addView(label("${getString(R.string.home_public_preview)}${version()}", 12, MUTED).apply { letterSpacing = .08f })
@@ -556,6 +584,97 @@ class DiPlayActivity : ComponentActivity() {
         section(content, getString(R.string.prefer_a_cable)) { card ->
             card.addView(label(getString(R.string.use_a_usb_data_cable_and_the_car_s_usb_data_port_unlock_yo), 16, MUTED))
             card.addView(button(getString(R.string.connect_with_usb), false) { connect(false) }, matchButton(12, 60))
+        }
+    }
+
+    /**
+     * Phone Projection page: connection method plus the Android CarLink panel.
+     *
+     * CarLink is an experimental framework: no official ICCOA CarLink SDK is
+     * integrated yet, so the panel drives a Mock protocol adapter and shows the
+     * real provider state instead of pretending a phone is connected.
+     */
+    private fun carlinkPanel(content: LinearLayout) {
+        content.addView(label(getString(R.string.phone_projection), 34, TEXT, true))
+        content.addView(label(getString(R.string.carlink_not_verified), 17, MUTED).apply { setPadding(0, dp(8), 0, dp(24)) })
+
+        section(content, getString(R.string.connection_method)) { card ->
+            val methods = listOf(
+                ProjectionMode.AUTO to getString(R.string.method_auto),
+                ProjectionMode.CARPLAY to getString(R.string.method_carplay),
+                ProjectionMode.CARLINK to getString(R.string.method_carlink),
+            )
+            val current = methods.indexOfFirst { it.first.name == DiPlayPreferences.projectionMethod(this) }
+                .coerceAtLeast(0)
+            choice(card, getString(R.string.connection_method), methods.map { it.second }, current, reconnects = false) { index ->
+                DiPlayPreferences.saveProjectionMethod(this, methods[index].first.name.lowercase())
+                ProjectionHost.manager.select(methods[index].first)
+            }
+        }
+
+        val backend = ProjectionHost.registerCarLink()
+        section(content, getString(R.string.carlink_framework)) { card ->
+            carLinkStatus = label("", 20, TEXT, true).apply { setPadding(0, dp(4), 0, dp(12)) }
+            card.addView(carLinkStatus)
+            card.addView(label(getString(R.string.carlink_supported), 15, MUTED).apply { setPadding(0, 0, 0, dp(8)) })
+            carLinkDevices = label("", 15, MUTED).apply { setPadding(0, 0, 0, dp(8)) }
+            card.addView(carLinkDevices)
+            carLinkDiscoverButton = button(getString(R.string.carlink_discover), true) {
+                backend.initialize()
+                backend.start()
+                refreshCarLinkPanel()
+            }
+            card.addView(carLinkDiscoverButton, matchButton(8, 60))
+            carLinkConnectButton = button(getString(R.string.carlink_connect), false) {
+                try {
+                    ProjectionHost.manager.select(ProjectionMode.CARLINK)
+                    ProjectionHost.manager.connect(null)
+                } catch (conflict: ProjectionResourceConflictException) {
+                    toast(getString(R.string.carlink_resource_busy))
+                } catch (error: Exception) {
+                    toast("${getString(R.string.carlink_status_error)}: ${error.message ?: error.javaClass.simpleName}")
+                }
+                refreshCarLinkPanel()
+            }
+            card.addView(carLinkConnectButton, matchButton(10, 60))
+            carLinkDisconnectButton = button(getString(R.string.carlink_disconnect), false) {
+                ProjectionHost.manager.disconnect()
+                refreshCarLinkPanel()
+            }
+            card.addView(carLinkDisconnectButton, matchButton(10, 60))
+        }
+        refreshCarLinkPanel()
+    }
+
+    /** Renders the CarLink backend state and discovered devices into the panel. */
+    private fun refreshCarLinkPanel() {
+        val backend = ProjectionHost.carLinkBackend ?: return
+        val state = backend.state
+        val statusText = when {
+            !backend.carLink.available -> getString(R.string.carlink_status_no_provider)
+            state is ProjectionState.Error ->
+                if (state.code == ProjectionErrorCode.PROVIDER_UNAVAILABLE) {
+                    getString(R.string.carlink_status_no_provider)
+                } else {
+                    "${getString(R.string.carlink_status_error)}: ${state.message}"
+                }
+            state == ProjectionState.Idle -> getString(R.string.carlink_status_disabled)
+            state == ProjectionState.Initializing || state == ProjectionState.Ready ->
+                getString(R.string.carlink_status_waiting)
+            state == ProjectionState.Discovering -> getString(R.string.carlink_status_discovering)
+            state == ProjectionState.Connecting -> getString(R.string.carlink_status_connecting)
+            state == ProjectionState.Connected -> getString(R.string.carlink_status_connected)
+            state == ProjectionState.Disconnecting -> getString(R.string.carlink_status_disconnecting)
+            else -> getString(R.string.carlink_status_disabled)
+        }
+        carLinkStatus?.text = "${getString(R.string.carlink_status_label)}: $statusText"
+        val devices = backend.discoveredDevices
+        carLinkDevices?.text = if (devices.isEmpty()) {
+            getString(R.string.carlink_status_waiting)
+        } else {
+            devices.joinToString("\n") { device: ProjectionDevice ->
+                "${device.name}${device.vendorHint?.let { " · $it" } ?: ""}"
+            }
         }
     }
 
