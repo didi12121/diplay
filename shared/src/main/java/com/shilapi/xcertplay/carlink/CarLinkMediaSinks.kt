@@ -1,9 +1,11 @@
 package com.shilapi.xcertplay.carlink
 
 import com.shilapi.xcertplay.media.AndroidMediaSink
-import com.shilapi.xcertplay.projection.media.ProjectionMediaSinkAdapter
 import com.shilapi.xcertplay.projection.ProjectionAudioSink
 import com.shilapi.xcertplay.projection.ProjectionVideoSink
+import com.shilapi.xcertplay.projection.display.ProjectionDisplayHost
+import com.shilapi.xcertplay.projection.display.ProjectionSurfaceHandle
+import com.shilapi.xcertplay.projection.media.ProjectionMediaSinkAdapter
 import java.io.Closeable
 
 /**
@@ -35,23 +37,51 @@ fun interface CarLinkMediaSinkProvider {
  * [AndroidMediaSink] pipeline CarPlay uses. One sink instance per session,
  * created on acquire and closed on release, so CarPlay and CarLink lifecycles
  * stay isolated even though the rendering infrastructure is shared.
+ *
+ * The rendering surface comes from the UI layer through [display] — the
+ * protocol stack never sees an Android Surface. When the session acquires
+ * sinks mid-life (or after an Activity recreate) the current surface is
+ * attached immediately; when the UI reports the surface destroyed the decoder
+ * detaches, and the session keeps running for a later re-attach.
  */
 class AndroidCarLinkMediaSinkProvider(
-    /** Optional app context; enables audio focus handling in AndroidMediaSink. */
+    /** UI-owned display host providing the rendering surface. */
+    private val display: ProjectionDisplayHost,
+    /**
+     * Application context — pass `applicationContext`, never an Activity:
+     * audio focus and AudioManager routes need a long-lived context and an
+     * Activity reference would leak.
+     */
     private val context: android.content.Context? = null,
-    /** Video surface type index (CarPlay uses 110 for its main screen). */
+    /** Video surface stream index (CarPlay uses 110 for its main screen). */
     private val screenType: Int = ProjectionMediaSinkAdapter.DEFAULT_SCREEN_TYPE,
 ) : CarLinkMediaSinkProvider {
 
     override fun acquire(): CarLinkMediaSinks {
-        val sink = AndroidMediaSink(
-            context = context,
-        )
+        val sink = AndroidMediaSink(context = context)
         val adapter = ProjectionMediaSinkAdapter(sink, screenType)
+        val listener = object : ProjectionDisplayHost.Listener {
+            override fun onSurfaceAvailable(handle: ProjectionSurfaceHandle) {
+                sink.attachScreenSurface(screenType, handle.surface)
+            }
+
+            override fun onSurfaceChanged(handle: ProjectionSurfaceHandle) {
+                sink.attachScreenSurface(screenType, handle.surface)
+            }
+
+            override fun onSurfaceDestroyed() {
+                sink.detachScreenSurface(screenType)
+            }
+        }
+        // Replays the current surface immediately when one exists.
+        display.addListener(listener)
         return CarLinkMediaSinks(
             video = adapter,
             audio = adapter,
-            onClose = { sink.close() },
+            onClose = {
+                display.removeListener(listener)
+                sink.close()
+            },
         )
     }
 }

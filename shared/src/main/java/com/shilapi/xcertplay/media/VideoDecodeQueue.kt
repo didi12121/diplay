@@ -6,8 +6,21 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 internal sealed interface VideoJob {
-    data class Config(val codec: VideoCodec, val codecData: ByteArray) : VideoJob
-    data class Frame(val nalus: ByteArray, val receivedNs: Long = System.nanoTime()) : VideoJob
+    data class Config(
+        val codec: VideoCodec,
+        val codecData: ByteArray,
+        /** Real coded size from the protocol (0 = unknown, use sink defaults). */
+        val width: Int = 0,
+        val height: Int = 0,
+    ) : VideoJob
+
+    data class Frame(
+        val nalus: ByteArray,
+        val receivedNs: Long = System.nanoTime(),
+        /** Real presentation timestamp in µs; PTS_UNSPECIFIED falls back to a clock. */
+        val presentationTimeUs: Long = AudioAccessUnit.PTS_UNSPECIFIED,
+    ) : VideoJob
+
     data class SurfaceChanged(val surface: Surface?) : VideoJob
     data object Resync : VideoJob
 }

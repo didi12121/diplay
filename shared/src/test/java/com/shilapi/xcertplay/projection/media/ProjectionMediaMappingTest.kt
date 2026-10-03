@@ -88,81 +88,20 @@ class ProjectionMediaMappingTest {
         assertEquals("alert", shared.audioType)
     }
 
-    // ---- Sink adapter ----
-
-    private class RecordingSink : MediaSink {
-        val videoCodecs = mutableListOf<VideoCodec>()
-        val videoConfigs = mutableListOf<ByteArray>()
-        val videoFrames = mutableListOf<ByteArray>()
-        var streamActive: Boolean? = null
-
-        override fun onVideoCodec(type: Int, codec: VideoCodec) {
-            videoCodecs.add(codec)
-        }
-
-        override fun onVideoConfig(type: Int, codecData: ByteArray) {
-            videoConfigs.add(codecData)
-        }
-
-        override fun onVideoFrame(type: Int, naluBytes: ByteArray) {
-            videoFrames.add(naluBytes)
-        }
-
-        override fun onScreenStreamActive(type: Int, active: Boolean) {
-            streamActive = active
-        }
-    }
+    // ---- PCM byte-order mapping ----
 
     @Test
-    fun sinkAdapterForwardsVideoWithoutCopyingWholeBuffers() {
-        val sink = RecordingSink()
-        val adapter = ProjectionMediaSinkAdapter(sink)
-        val payload = byteArrayOf(0, 1, 2, 3, 4)
-        adapter.onVideoConfig(ProjectionVideoConfig(ProjectionVideoCodec.H265, byteArrayOf(9, 9)))
-        adapter.onVideoFrame(
-            ProjectionVideoFrame(
-                codec = ProjectionVideoCodec.H265,
-                width = 1920,
-                height = 720,
-                presentationTimeUs = 1L,
-                keyFrame = true,
-                payload = payload,
-            ),
+    fun pcmSampleFormatMapsToRendererEncoding() {
+        assertEquals(
+            com.shilapi.xcertplay.media.PcmEncoding.PCM_S16_LE,
+            ProjectionMediaMapping.toPcmEncoding(com.shilapi.xcertplay.projection.ProjectionSampleFormat.PCM_S16_LE),
         )
-        // Codec is announced once with the config, not per frame.
-        assertEquals(listOf(VideoCodec.H265), sink.videoCodecs)
-        assertArrayEquals(byteArrayOf(9, 9), sink.videoConfigs.single())
-        // Whole-buffer windows must be forwarded by reference, not copied.
-        assertSame(payload, sink.videoFrames.single())
-    }
-
-    @Test
-    fun sinkAdapterCopiesOnlySubRangePayloads() {
-        val sink = RecordingSink()
-        val adapter = ProjectionMediaSinkAdapter(sink)
-        val payload = byteArrayOf(0, 1, 2, 3, 4)
-        adapter.onVideoFrame(
-            ProjectionVideoFrame(
-                codec = ProjectionVideoCodec.H264,
-                width = 0,
-                height = 0,
-                presentationTimeUs = 0L,
-                keyFrame = false,
-                payload = payload,
-                offset = 1,
-                length = 3,
-            ),
+        assertEquals(
+            com.shilapi.xcertplay.media.PcmEncoding.PCM_S16_BE,
+            ProjectionMediaMapping.toPcmEncoding(com.shilapi.xcertplay.projection.ProjectionSampleFormat.PCM_S16_BE),
         )
-        assertArrayEquals(byteArrayOf(1, 2, 3), sink.videoFrames.single())
     }
 
-    @Test
-    fun sinkAdapterForwardsStreamActiveFlag() {
-        val sink = RecordingSink()
-        val adapter = ProjectionMediaSinkAdapter(sink)
-        adapter.onVideoStreamActive(true)
-        assertEquals(true, sink.streamActive)
-        adapter.onVideoStreamActive(false)
-        assertEquals(false, sink.streamActive)
-    }
+    // Sink-adapter forwarding (codec/size/PTS/window preservation) is covered
+    // by ProjectionMediaSinkAdapterTest against the neutral AccessUnitMediaSink.
 }

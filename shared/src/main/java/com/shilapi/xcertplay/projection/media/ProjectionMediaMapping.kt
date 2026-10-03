@@ -12,6 +12,7 @@ import com.shilapi.xcertplay.projection.ProjectionAudioChannel
 import com.shilapi.xcertplay.projection.ProjectionAudioCodec
 import com.shilapi.xcertplay.projection.ProjectionAudioFormat
 import com.shilapi.xcertplay.projection.ProjectionAudioStreamId
+import com.shilapi.xcertplay.projection.ProjectionSampleFormat
 import com.shilapi.xcertplay.projection.ProjectionVideoCodec
 
 /**
@@ -98,6 +99,12 @@ object ProjectionMediaMapping {
         ProjectionAudioCodec.OPUS -> AudioCodecKind.OPUS
         ProjectionAudioCodec.LPCM -> AudioCodecKind.LPCM
     }
+
+    fun toPcmEncoding(format: ProjectionSampleFormat): com.shilapi.xcertplay.media.PcmEncoding =
+        when (format) {
+            ProjectionSampleFormat.PCM_S16_LE -> com.shilapi.xcertplay.media.PcmEncoding.PCM_S16_LE
+            ProjectionSampleFormat.PCM_S16_BE -> com.shilapi.xcertplay.media.PcmEncoding.PCM_S16_BE
+        }
 
     fun toProjectionAudioCodec(codec: AudioCodecKind): ProjectionAudioCodec = when (codec) {
         AudioCodecKind.AAC_LC -> ProjectionAudioCodec.AAC_LC

@@ -22,6 +22,19 @@ enum class ProjectionAudioCodec {
     LPCM,
 }
 
+/**
+ * Byte order of raw PCM16 payloads. AAC/Opus are unaffected. CarLink SDKs may
+ * deliver either order — never assume a protocol matches Apple's big-endian
+ * wired LPCM.
+ */
+enum class ProjectionSampleFormat {
+    /** Little-endian PCM16 (AudioTrack native). */
+    PCM_S16_LE,
+
+    /** Big-endian PCM16 (Apple wired LPCM). */
+    PCM_S16_BE,
+}
+
 /** Stream format of one audio stream. */
 class ProjectionAudioFormat(
     val codec: ProjectionAudioCodec,
@@ -33,6 +46,8 @@ class ProjectionAudioFormat(
     val payloadType: Int = 0,
     /** Backend wire type name (e.g. CarPlay `audioType`), for mapping tables only. */
     val wireType: String = "",
+    /** PCM byte order; ignored for encoded codecs. */
+    val sampleFormat: ProjectionSampleFormat = ProjectionSampleFormat.PCM_S16_LE,
 )
 
 /** Identity of one audio stream inside a session. */

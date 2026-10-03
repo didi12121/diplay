@@ -6,16 +6,18 @@ import com.shilapi.xcertplay.carlink.CarLinkProjectionBackend
 import com.shilapi.xcertplay.carlink.CarLinkProtocolAdapter
 import com.shilapi.xcertplay.carlink.MockCarLinkProtocolAdapter
 import com.shilapi.xcertplay.carlink.UnavailableCarLinkProtocolAdapter
+import com.shilapi.xcertplay.projection.display.ProjectionSurfaceHost
 
 /**
  * Process-local projection host: one [ProjectionManager] with the registered
- * backends every UI surface shares.
+ * backends every UI surface shares, plus the process-level
+ * [ProjectionSurfaceHost] the UI pushes rendering surfaces into.
  *
  * The CarPlay backend is registered by `CarPlayHostActivity` when it creates (or
  * adopts) its controller, because only that layer owns the Apple construction
  * parameters. The CarLink backend is registered with an injected protocol
  * adapter and a real media sink provider (the shared `AndroidMediaSink`
- * pipeline).
+ * pipeline rendering into [display]'s surface).
  *
  * **Production default**: [UnavailableCarLinkProtocolAdapter]. Without an
  * official ICCOA CarLink SDK there is NO provider, and the UI must show
@@ -25,6 +27,14 @@ import com.shilapi.xcertplay.carlink.UnavailableCarLinkProtocolAdapter
  */
 object ProjectionHost {
     val manager: ProjectionManager = ProjectionManager(logger = ProjectionLogger.ANDROID)
+
+    /**
+     * Process-level display host: projection host activities push their
+     * SurfaceView/TextureView surfaces here; media providers attach renderers
+     * to it. Lives as long as the process so an Activity recreate re-attaches
+     * without dropping a live session.
+     */
+    val display: ProjectionSurfaceHost = ProjectionSurfaceHost()
 
     /** Stable no-provider instance so repeated registration is idempotent. */
     private val unavailableAdapter: CarLinkProtocolAdapter = UnavailableCarLinkProtocolAdapter()
@@ -40,20 +50,21 @@ object ProjectionHost {
      * (UI, media sinks, resource arbitration) works unchanged.
      *
      * Media sinks default to the shared Android rendering pipeline
-     * (`AndroidCarLinkMediaSinkProvider`), so a real session's video/audio reach
-     * AndroidMediaSink → MediaCodec / AudioTrack like CarPlay's.
+     * ([AndroidCarLinkMediaSinkProvider]) rendering into [display]'s surface —
+     * pass `context = applicationContext` so audio focus/routes work.
      */
     @Synchronized
     fun registerCarLink(
         adapter: CarLinkProtocolAdapter = unavailableAdapter,
-        mediaSinks: CarLinkMediaSinkProvider = AndroidCarLinkMediaSinkProvider(),
+        mediaSinks: CarLinkMediaSinkProvider? = null,
+        context: android.content.Context? = null,
     ): CarLinkProjectionBackend {
         val existing = carLinkBackend
         if (existing != null && adapter === carLinkAdapter) return existing
         carLinkAdapter = adapter
         val backend = CarLinkProjectionBackend(
             adapter = adapter,
-            mediaSinks = mediaSinks,
+            mediaSinks = mediaSinks ?: AndroidCarLinkMediaSinkProvider(display, context),
             logger = ProjectionLogger.ANDROID,
         )
         manager.register(backend)
@@ -67,7 +78,7 @@ object ProjectionHost {
      */
     @Synchronized
     fun registerCarLinkMock(
-        mediaSinks: CarLinkMediaSinkProvider = AndroidCarLinkMediaSinkProvider(),
+        mediaSinks: CarLinkMediaSinkProvider,
         adapter: MockCarLinkProtocolAdapter = MockCarLinkProtocolAdapter(),
     ): CarLinkProjectionBackend = registerCarLink(adapter, mediaSinks)
 
