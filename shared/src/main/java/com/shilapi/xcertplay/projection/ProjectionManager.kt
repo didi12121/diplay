@@ -29,6 +29,20 @@ sealed class ProjectionTakeoverOutcome {
 }
 
 /**
+ * Completion events of a [ProjectionManager.takeover]. AwaitingStop takeovers
+ * complete asynchronously — exactly one of these callbacks fires then, and
+ * [onTakeoverActivated] means the target backend is now really active and the
+ * caller may start its session (e.g. `CarPlayController.start()`).
+ */
+interface ProjectionTakeoverListener {
+    /** The target backend completed takeover and owns the shared resources. */
+    fun onTakeoverActivated(targetId: String)
+
+    /** The takeover failed; the target was NOT started and owns nothing. */
+    fun onTakeoverFailed(targetId: String, message: String)
+}
+
+/**
  * Front door of the projection host: registers backends, arbitrates shared
  * resources, selects and switches the active backend, and mirrors backend state
  * to listeners. It holds no protocol logic — everything protocol specific stays
@@ -60,7 +74,11 @@ class ProjectionManager(
     private val stateListeners = java.util.concurrent.CopyOnWriteArrayList<ProjectionStateListener>()
 
     /** Target of a takeover waiting for an old session to actually stop. */
-    private data class PendingTakeover(val targetId: String, val device: ProjectionDevice?)
+    private data class PendingTakeover(
+        val targetId: String,
+        val device: ProjectionDevice?,
+        val listener: ProjectionTakeoverListener?,
+    )
 
     @Volatile
     private var pendingTakeover: PendingTakeover? = null
@@ -116,7 +134,9 @@ class ProjectionManager(
     /**
      * Removes [backendId] from the registry. Shared resources are released only
      * when the backend's session is confirmed stopped; a still-running session
-     * keeps its claims until [onBackendSessionStopped].
+     * keeps its claims until [onBackendSessionStopped] — the session-stopped
+     * listener is deliberately kept so an unregistered backend can still
+     * confirm its real stop and free its lease.
      */
     fun unregister(backendId: String) {
         val removed: ProjectionBackend?
@@ -125,7 +145,6 @@ class ProjectionManager(
         }
         removed?.let {
             it.removeStateListener(backendStateBridge)
-            it.setSessionStoppedListener(null)
             if (activeBackendId == it.id) activeBackendId = null
             if (!it.isSessionActive) {
                 coordinator.release(backendId)
@@ -186,9 +205,15 @@ class ProjectionManager(
      * stop, releases resources only after the sessions are confirmed stopped,
      * then activates the target. Returns [ProjectionTakeoverOutcome.AwaitingStop]
      * when an externally-owned session is still tearing down; the pending
-     * takeover completes automatically on [onBackendSessionStopped].
+     * takeover completes automatically on [onBackendSessionStopped] and fires
+     * [listener] — the caller must NOT start the target session before
+     * [ProjectionTakeoverListener.onTakeoverActivated].
      */
-    fun takeover(targetId: String, device: ProjectionDevice? = null): ProjectionTakeoverOutcome {
+    fun takeover(
+        targetId: String,
+        device: ProjectionDevice? = null,
+        listener: ProjectionTakeoverListener? = null,
+    ): ProjectionTakeoverOutcome {
         val target = backend(targetId)
             ?: return ProjectionTakeoverOutcome.Blocked(
                 ProjectionResourceConflictException(
@@ -197,7 +222,7 @@ class ProjectionManager(
                     ownerBackendId = "none",
                     requestingBackendId = targetId,
                 ),
-            )
+            ).also { listener?.onTakeoverFailed(targetId, "backend=$targetId is not registered") }
         val blockers = registeredBackends.filter { it.id != targetId && it.isSessionActive }
         for (blocker in blockers) {
             val stopped = requestStop(blocker)
@@ -205,14 +230,16 @@ class ProjectionManager(
         }
         val remaining = blockers.firstOrNull { it.isSessionActive }
         if (remaining != null) {
-            synchronized(lock) { pendingTakeover = PendingTakeover(targetId, device) }
+            synchronized(lock) { pendingTakeover = PendingTakeover(targetId, device, listener) }
             logger.log("manager takeover-awaiting backend=${remaining.id} target=$targetId")
             return ProjectionTakeoverOutcome.AwaitingStop(remaining.id)
         }
         return try {
             connectInternal(target, device)
+            listener?.onTakeoverActivated(targetId)
             ProjectionTakeoverOutcome.Activated(targetId)
         } catch (conflict: ProjectionResourceConflictException) {
+            listener?.onTakeoverFailed(targetId, conflict.message ?: "resource conflict")
             ProjectionTakeoverOutcome.Blocked(conflict)
         }
     }
@@ -221,6 +248,10 @@ class ProjectionManager(
      * Owner callback: the underlying session of [backendId] has **actually**
      * stopped. Releases its shared resources and completes any pending
      * takeover. Ignored when a new session is already running (rapid restart).
+     *
+     * Works even after [unregister]: backend registration lifetime and
+     * resource-lease lifetime are deliberately decoupled — a lease is only
+     * dropped on this confirmation (or an explicit force release).
      */
     fun onBackendSessionStopped(backendId: String) {
         val backend = backend(backendId)
@@ -233,12 +264,17 @@ class ProjectionManager(
         val pending = synchronized(lock) {
             pendingTakeover.also { pendingTakeover = null }
         } ?: return
-        val target = backend(pending.targetId) ?: return
+        val target = backend(pending.targetId)
+        if (target == null) {
+            pending.listener?.onTakeoverFailed(pending.targetId, "target backend vanished")
+            return
+        }
         try {
             connectInternal(target, pending.device)
-            notifySelection(target.id)
+            pending.listener?.onTakeoverActivated(pending.targetId)
         } catch (conflict: ProjectionResourceConflictException) {
             logger.log("manager takeover-completed-with-conflict ${conflict.message}")
+            pending.listener?.onTakeoverFailed(pending.targetId, conflict.message ?: "resource conflict")
         }
     }
 
@@ -252,6 +288,10 @@ class ProjectionManager(
      * Disconnects [backendId]. Returns true when resources were released now
      * (session confirmed stopped); false when teardown is asynchronous — the
      * claims stay until [onBackendSessionStopped].
+     *
+     * A failing adapter still counts as stopped once its session state is torn
+     * down (the controller reports `sessionActive == false` after its exception
+     * boundary), so an Error state never leaks a hardware lease.
      */
     fun disconnectBackend(backendId: String): Boolean {
         val target = backend(backendId)
@@ -260,8 +300,8 @@ class ProjectionManager(
             return true
         }
         logger.log("manager disconnect backend=$backendId")
-        val stopped = requestStop(target)
-        return if (stopped && !target.isSessionActive) {
+        requestStop(target)
+        return if (!target.isSessionActive) {
             coordinator.release(backendId)
             true
         } else {

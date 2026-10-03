@@ -5,6 +5,23 @@ import com.shilapi.xcertplay.projection.ProjectionLogger
 import com.shilapi.xcertplay.projection.ProjectionMetadata
 
 /**
+ * Explicit result of a [CarLinkController] operation. Backends must only
+ * advance their state machine (e.g. Initializing → Ready) on [Success]; a
+ * [Failure] keeps the propagated `ProjectionState.Error` visible instead of
+ * overwriting it with a healthy state.
+ */
+sealed class CarLinkOperationResult {
+    data object Success : CarLinkOperationResult()
+    data class Failure(
+        val code: String,
+        val message: String,
+        val cause: Throwable? = null,
+    ) : CarLinkOperationResult()
+
+    val isSuccess: Boolean get() = this is Success
+}
+
+/**
  * Session orchestrator between [CarLinkProtocolAdapter] and the shared media
  * layer. It owns discovery state, the discovered device list, the channels, and
  * the metadata fan-out — but no protocol details. Swap the adapter and the whole
@@ -81,47 +98,55 @@ class CarLinkController(
         sessionListeners.remove(listener)
     }
 
-    fun initialize() {
+    fun initialize(): CarLinkOperationResult {
         if (!adapter.isAvailable) {
             diagnostics.event("provider-unavailable")
-            return
+            return CarLinkOperationResult.Failure(
+                "PROVIDER_UNAVAILABLE",
+                CarLinkProjectionBackend.PROVIDER_UNAVAILABLE_MESSAGE,
+            )
         }
-        guarded("initialize") {
+        return guarded("initialize") {
             adapter.initialize()
             diagnostics.event("initialize", "provider=${adapter.providerName}")
         }
     }
 
-    fun startDiscovery() {
-        if (!adapter.isAvailable) return
+    fun startDiscovery(): CarLinkOperationResult {
+        if (!adapter.isAvailable) {
+            return CarLinkOperationResult.Failure(
+                "PROVIDER_UNAVAILABLE",
+                CarLinkProjectionBackend.PROVIDER_UNAVAILABLE_MESSAGE,
+            )
+        }
         discovered.clear()
         diagnostics.event("discovering")
-        guarded("startDiscovery") { adapter.startDiscovery() }
+        return guarded("startDiscovery") { adapter.startDiscovery() }
     }
 
     fun stopDiscovery() {
         guarded("stopDiscovery") { adapter.stopDiscovery() }
     }
 
-    fun connect(device: ProjectionDevice?) {
+    fun connect(device: ProjectionDevice?): CarLinkOperationResult {
         if (!adapter.isAvailable) {
-            emit(CarLinkSessionEvent.Error("PROVIDER_UNAVAILABLE", CarLinkProjectionBackend.PROVIDER_UNAVAILABLE_MESSAGE))
-            return
+            val message = CarLinkProjectionBackend.PROVIDER_UNAVAILABLE_MESSAGE
+            emit(CarLinkSessionEvent.Error("PROVIDER_UNAVAILABLE", message))
+            return CarLinkOperationResult.Failure("PROVIDER_UNAVAILABLE", message)
         }
         val target = device?.let { projection ->
             discovered.firstOrNull { it.deviceId == projection.id }
         } ?: discovered.firstOrNull()
         if (target == null) {
-            emit(CarLinkSessionEvent.Error("CONNECT_FAILED", "no CarLink device discovered yet"))
-            return
+            val message = "no CarLink device discovered yet"
+            emit(CarLinkSessionEvent.Error("CONNECT_FAILED", message))
+            return CarLinkOperationResult.Failure("CONNECT_FAILED", message)
         }
         diagnostics.event("connecting", "device=${target.deviceId}")
-        guarded("connect") { adapter.connect(target) }
+        return guarded("connect") { adapter.connect(target) }
     }
 
-    fun disconnect() {
-        guarded("disconnect") { adapter.disconnect() }
-    }
+    fun disconnect(): CarLinkOperationResult = guarded("disconnect") { adapter.disconnect() }
 
     fun dispose() {
         try {
@@ -137,22 +162,25 @@ class CarLinkController(
     fun offMetadata(listener: (ProjectionMetadata) -> Unit) = metadata.removeListener(listener)
 
     /** Runs an adapter call; failures become session errors, never exceptions. */
-    private fun guarded(operation: String, block: () -> Unit) {
-        try {
+    private fun guarded(operation: String, block: () -> Unit): CarLinkOperationResult {
+        return try {
             block()
+            CarLinkOperationResult.Success
         } catch (error: Exception) {
             diagnostics.event(
                 "adapter-failed",
                 "op=$operation error=${error.javaClass.simpleName}",
             )
             teardownSession(operation)
+            val message = "CarLink adapter $operation failed: ${error.javaClass.simpleName}"
             emit(
                 CarLinkSessionEvent.Error(
                     code = "ADAPTER_FAILURE",
-                    message = "CarLink adapter $operation failed: ${error.javaClass.simpleName}",
+                    message = message,
                     cause = error,
                 ),
             )
+            CarLinkOperationResult.Failure("ADAPTER_FAILURE", message, error)
         }
     }
 

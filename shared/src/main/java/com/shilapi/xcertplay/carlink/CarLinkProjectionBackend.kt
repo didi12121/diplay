@@ -46,7 +46,7 @@ import com.shilapi.xcertplay.projection.ProjectionTransport
 class CarLinkProjectionBackend(
     private val adapter: CarLinkProtocolAdapter,
     private val mediaSinks: CarLinkMediaSinkProvider,
-    logger: ProjectionLogger = ProjectionLogger.NONE,
+    private val logger: ProjectionLogger = ProjectionLogger.NONE,
 ) : ProjectionBackend {
 
     override val id: String = ID
@@ -127,14 +127,24 @@ class CarLinkProjectionBackend(
             return
         }
         stateStore.publish(ProjectionState.Initializing)
-        controller.initialize()
-        stateStore.publish(ProjectionState.Ready)
+        // Only advance to Ready on a real success: a failing adapter publishes
+        // Error (via the session listener) and that Error must stay visible —
+        // never be overwritten by a healthy state.
+        val result = controller.initialize()
+        if (result.isSuccess) {
+            stateStore.publish(ProjectionState.Ready)
+        }
     }
 
     override fun start() {
         if (!adapter.isAvailable) return
         stateStore.publish(ProjectionState.Discovering)
-        controller.startDiscovery()
+        val result = controller.startDiscovery()
+        if (!result.isSuccess) {
+            // Error already published through the session listener; discovery
+            // must not claim progress over it.
+            logger.log("backend=$ID discovery-failed code=${result.code()}")
+        }
     }
 
     override fun stop() {
@@ -151,14 +161,20 @@ class CarLinkProjectionBackend(
         }
         currentTransport = device?.transport ?: ProjectionTransport.UNKNOWN
         stateStore.publish(ProjectionState.Connecting)
-        controller.connect(device)
+        val result = controller.connect(device)
+        if (!result.isSuccess) {
+            logger.log("backend=$ID connect-failed code=${result.code()}")
+        }
     }
 
     override fun disconnect(): Boolean {
         if (stateStore.state is ProjectionState.Connected) {
             stateStore.publish(ProjectionState.Disconnecting)
         }
-        controller.disconnect()
+        val result = controller.disconnect()
+        if (!result.isSuccess) {
+            logger.log("backend=$ID disconnect-failed code=${result.code()}")
+        }
         // The controller tears its session state down synchronously for
         // adapters that stop inline; asynchronous adapters end via
         // onSessionEnded → session-stopped notification.
@@ -190,6 +206,9 @@ class CarLinkProjectionBackend(
             ),
         )
     }
+
+    private fun CarLinkOperationResult.code(): String =
+        (this as? CarLinkOperationResult.Failure)?.code ?: "ok"
 
     private fun onSessionEvent(event: CarLinkSessionEvent) {
         when (event) {
