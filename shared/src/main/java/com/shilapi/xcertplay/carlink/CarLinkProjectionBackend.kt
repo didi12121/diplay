@@ -1,6 +1,5 @@
 package com.shilapi.xcertplay.carlink
 
-import com.shilapi.xcertplay.projection.ProjectionAudioSink
 import com.shilapi.xcertplay.projection.ProjectionBackend
 import com.shilapi.xcertplay.projection.ProjectionCapabilities
 import com.shilapi.xcertplay.projection.ProjectionDevice
@@ -12,7 +11,7 @@ import com.shilapi.xcertplay.projection.ProjectionState
 import com.shilapi.xcertplay.projection.ProjectionStateListener
 import com.shilapi.xcertplay.projection.ProjectionStateStore
 import com.shilapi.xcertplay.projection.ProjectionTouchEvent
-import com.shilapi.xcertplay.projection.ProjectionVideoSink
+import com.shilapi.xcertplay.projection.ProjectionTransport
 
 /**
  * ICCOA CarLink projection backend.
@@ -28,18 +27,25 @@ import com.shilapi.xcertplay.projection.ProjectionVideoSink
  *       ↓
  * CarLinkController
  *       ↓
- * CarLinkProtocolAdapter   ← MockCarLinkProtocolAdapter today,
+ * CarLinkProtocolAdapter   ← MockCarLinkProtocolAdapter (tests/dev harness only),
  *       ↓                     OfficialCarLinkSdkAdapter / NativeCarLinkProtocolAdapter later
  * ICCOA CarLink SDK / protocol
  * ```
+ *
+ * Media: real sessions acquire [CarLinkMediaSinks] from the injected
+ * [CarLinkMediaSinkProvider] when the session starts and release them when it
+ * ends, so video/audio reach the shared Android rendering pipeline
+ * (ProjectionMediaSinkAdapter → AndroidMediaSink → MediaCodec / AudioTrack).
+ *
+ * Resources: [requiredResourcesFor] computes the shared hardware from the
+ * session's negotiated transport (USB vs wireless), not a fixed list.
  *
  * With no SDK installed the backend reports
  * `CarLink protocol provider unavailable` instead of pretending to connect.
  */
 class CarLinkProjectionBackend(
     private val adapter: CarLinkProtocolAdapter,
-    videoSink: ProjectionVideoSink = ProjectionVideoSink.NOOP,
-    audioSink: ProjectionAudioSink = ProjectionAudioSink.NOOP,
+    private val mediaSinks: CarLinkMediaSinkProvider,
     logger: ProjectionLogger = ProjectionLogger.NONE,
 ) : ProjectionBackend {
 
@@ -52,26 +58,48 @@ class CarLinkProjectionBackend(
         audioChannels = CarLinkCapabilities.audioChannels,
         inputKinds = CarLinkCapabilities.inputKinds,
         maxTouchContacts = CarLinkCapabilities.MAX_TOUCH_CONTACTS,
-        microphoneUplink = false,
+        microphoneUplink = CarLinkCapabilities.MICROPHONE_UPLINK_RESERVED,
         metadata = true,
         navigation = true,
     )
 
-    override val requiredResources: Set<ProjectionResource> = setOf(
-        ProjectionResource.USB,
-        ProjectionResource.WIFI,
-        ProjectionResource.AUDIO,
-    )
+    /**
+     * Transport-aware resources: USB CarLink claims USB+AUDIO, wireless claims
+     * WIFI+AUDIO. Before a device is known, AUDIO alone is claimed and the
+     * per-session set is re-evaluated at connect time via
+     * [requiredResourcesFor].
+     */
+    override val requiredResources: Set<ProjectionResource> =
+        CarLinkCapabilities.resourcesFor(ProjectionTransport.UNKNOWN)
 
     private val stateStore = ProjectionStateStore(ID, logger)
-    private val controller = CarLinkController(adapter, videoSink, audioSink, logger, ID)
+
+    @Volatile
+    private var sessionStoppedListener: Runnable? = null
+
+    /** Last negotiated transport; feeds [requiredResourcesFor] when device=null. */
+    @Volatile
+    private var currentTransport: ProjectionTransport = ProjectionTransport.UNKNOWN
+
+    private val controller = CarLinkController(
+        adapter = adapter,
+        mediaSinks = mediaSinks,
+        logger = logger,
+        backendId = ID,
+    )
 
     override val state: ProjectionState
         get() = stateStore.state
 
-    /** Devices discovery found so far. */
-    val discoveredDevices: List<ProjectionDevice>
-        get() = controller.discoveredDevices()
+    override val isSessionActive: Boolean
+        get() = controller.sessionActive
+
+    override fun requiredResourcesFor(device: ProjectionDevice?): Set<ProjectionResource> =
+        CarLinkCapabilities.resourcesFor(
+            device?.transport ?: currentTransport,
+        )
+
+    override fun discoveredDevices(): List<ProjectionDevice> = controller.discoveredDevices()
 
     /** The CarLink controller, for UI/diagnostics and metadata listeners. */
     val carLink: CarLinkController
@@ -89,16 +117,13 @@ class CarLinkProjectionBackend(
         stateStore.removeListener(listener)
     }
 
+    override fun setSessionStoppedListener(listener: Runnable?) {
+        sessionStoppedListener = listener
+    }
+
     override fun initialize() {
         if (!adapter.isAvailable) {
-            stateStore.publish(
-                ProjectionState.Error(
-                    code = ProjectionErrorCode.PROVIDER_UNAVAILABLE,
-                    message = PROVIDER_UNAVAILABLE_MESSAGE,
-                    cause = null,
-                    backendId = ID,
-                ),
-            )
+            publishProviderUnavailable()
             return
         }
         stateStore.publish(ProjectionState.Initializing)
@@ -121,26 +146,23 @@ class CarLinkProjectionBackend(
 
     override fun connect(device: ProjectionDevice?) {
         if (!adapter.isAvailable) {
-            stateStore.publish(
-                ProjectionState.Error(
-                    code = ProjectionErrorCode.PROVIDER_UNAVAILABLE,
-                    message = PROVIDER_UNAVAILABLE_MESSAGE,
-                    cause = null,
-                    backendId = ID,
-                ),
-            )
+            publishProviderUnavailable()
             return
         }
+        currentTransport = device?.transport ?: ProjectionTransport.UNKNOWN
         stateStore.publish(ProjectionState.Connecting)
         controller.connect(device)
     }
 
-    override fun disconnect() {
+    override fun disconnect(): Boolean {
         if (stateStore.state is ProjectionState.Connected) {
             stateStore.publish(ProjectionState.Disconnecting)
         }
         controller.disconnect()
-        stateStore.publish(ProjectionState.Ready)
+        // The controller tears its session state down synchronously for
+        // adapters that stop inline; asynchronous adapters end via
+        // onSessionEnded → session-stopped notification.
+        return !controller.sessionActive
     }
 
     override fun onTouchEvent(event: ProjectionTouchEvent): Boolean {
@@ -158,27 +180,48 @@ class CarLinkProjectionBackend(
         stateStore.publish(ProjectionState.Idle)
     }
 
+    private fun publishProviderUnavailable() {
+        stateStore.publish(
+            ProjectionState.Error(
+                code = ProjectionErrorCode.PROVIDER_UNAVAILABLE,
+                message = PROVIDER_UNAVAILABLE_MESSAGE,
+                cause = null,
+                backendId = ID,
+            ),
+        )
+    }
+
     private fun onSessionEvent(event: CarLinkSessionEvent) {
         when (event) {
-            is CarLinkSessionEvent.Connected -> stateStore.publish(ProjectionState.Connected)
-            is CarLinkSessionEvent.Disconnected ->
+            is CarLinkSessionEvent.Connected -> {
+                currentTransport = event.device.transport
+                stateStore.publish(ProjectionState.Connected)
+            }
+            is CarLinkSessionEvent.Disconnected -> {
                 stateStore.publish(ProjectionState.Ready)
+                // The session really ended: release arbitration hold.
+                sessionStoppedListener?.run()
+            }
             is CarLinkSessionEvent.Error -> {
                 val code = when (event.code) {
                     "PROVIDER_UNAVAILABLE" -> ProjectionErrorCode.PROVIDER_UNAVAILABLE
                     "CONNECT_FAILED" -> ProjectionErrorCode.CONNECT_FAILED
                     "TIMEOUT" -> ProjectionErrorCode.TIMEOUT
                     "AUTH" -> ProjectionErrorCode.AUTHENTICATION_FAILED
+                    "ADAPTER_FAILURE" -> ProjectionErrorCode.PROTOCOL_ERROR
+                    "RESOURCE_CONFLICT" -> ProjectionErrorCode.RESOURCE_CONFLICT
                     else -> ProjectionErrorCode.PROTOCOL_ERROR
                 }
                 stateStore.publish(
                     ProjectionState.Error(
                         code = code,
                         message = event.message,
-                        cause = null,
+                        cause = event.cause,
                         backendId = ID,
                     ),
                 )
+                // A failed session holds nothing; if it was up, it is gone now.
+                if (!controller.sessionActive) sessionStoppedListener?.run()
             }
         }
     }

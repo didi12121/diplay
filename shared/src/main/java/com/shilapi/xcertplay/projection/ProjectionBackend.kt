@@ -10,8 +10,14 @@ import java.io.Closeable
  *
  * Threading follows the existing DiPlay model (no coroutines in `shared`):
  * implementations own their worker executors, lifecycle methods return quickly,
- * state changes are published through [ProjectionStateStore] and listeners may be
+ * state changes are published through `ProjectionStateStore` and listeners may be
  * called on any thread. Callers on the UI must re-post to the main thread.
+ *
+ * Resource rule: a backend may hold shared hardware (`ProjectionResource`)
+ * **only while its underlying session is actually running or stopping has been
+ * confirmed**. [disconnect] therefore reports whether the session is already
+ * confirmed stopped; externally-owned sessions answer `false` and their host
+ * later confirms via `ProjectionManager.onBackendSessionStopped`.
  */
 interface ProjectionBackend : Closeable {
     /** Stable id, e.g. `carplay`, `carlink`. */
@@ -25,9 +31,37 @@ interface ProjectionBackend : Closeable {
     /** Current lifecycle state. */
     val state: ProjectionState
 
-    /** Shared resources this backend needs while running; used for arbitration. */
+    /**
+     * True while the backend's underlying protocol session is actually running
+     * (or still tearing down). This is the ground truth for resource
+     * arbitration: a wrapped, externally-owned session stays `true` until its
+     * host really stopped it.
+     */
+    val isSessionActive: Boolean
+
+    /** Default shared resources this backend needs; see [requiredResourcesFor]. */
     val requiredResources: Set<ProjectionResource>
         get() = emptySet()
+
+    /**
+     * Shared resources needed when connecting to [device]. Defaults to
+     * [requiredResources]; backends with per-session negotiation (e.g. USB vs
+     * wireless CarLink) override this.
+     */
+    fun requiredResourcesFor(device: ProjectionDevice?): Set<ProjectionResource> =
+        requiredResources
+
+    /** Devices discovery found so far; used by AUTO selection and connect(null). */
+    fun discoveredDevices(): List<ProjectionDevice> = emptyList()
+
+    /**
+     * Registered by `ProjectionManager`: implementations invoke it once their
+     * underlying session has **actually** stopped after an asynchronous
+     * teardown (e.g. a wrapped, host-owned session). Backends whose
+     * [disconnect] already confirms the stop synchronously may leave this
+     * unused.
+     */
+    fun setSessionStoppedListener(listener: Runnable?) {}
 
     /** Subscribes to state changes; may be called before [initialize]. */
     fun addStateListener(listener: ProjectionStateListener)
@@ -46,8 +80,14 @@ interface ProjectionBackend : Closeable {
     /** Connects to a specific device, or to the first discovered one when null. */
     fun connect(device: ProjectionDevice?)
 
-    /** Ends the current session and releases session resources. */
-    fun disconnect()
+    /**
+     * Ends the current session. Returns **true** when the underlying session is
+     * confirmed stopped and shared resources may be released immediately.
+     * Returns **false** when teardown completes asynchronously (externally-owned
+     * sessions): resources must stay claimed until the owner confirms via
+     * `ProjectionManager.onBackendSessionStopped(id)`.
+     */
+    fun disconnect(): Boolean
 
     /** Feeds a unified touch event into this backend's input channel. */
     fun onTouchEvent(event: ProjectionTouchEvent): Boolean

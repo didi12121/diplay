@@ -11,9 +11,12 @@ enum class ProjectionResource {
 
 class ProjectionResourceConflictException(
     message: String,
-    val resource: ProjectionResource,
+    /** First conflicting resource, or null when the conflict is session-level. */
+    val resource: ProjectionResource?,
     val ownerBackendId: String,
     val requestingBackendId: String,
+    /** Every resource involved in the conflict. */
+    val resources: Set<ProjectionResource> = resource?.let { setOf(it) } ?: emptySet(),
 ) : IllegalStateException(message)
 
 /**

@@ -29,12 +29,17 @@ import com.shilapi.xcertplay.projection.logName
  * hints used by `ProjectionManager` arbitration.
  *
  * Two lifecycle modes:
- *  - **owned** — created via the [sessionFactory] constructor; `start()`/`close()`
- *    drive the controller;
- *  - **wrapped** — created via [attach] around a controller the host activity
- *    already owns and starts (the current DiPlay CarPlay flow). Lifecycle calls
- *    then only mirror projection state and never stop the session behind the
- *    host's back, keeping existing CarPlay behavior byte-for-byte.
+ *  - **owned** — created via the [CarPlayProjectionBackend.owned] factory;
+ *    `start()`/`disconnect()` drive the controller and can confirm a stop;
+ *  - **wrapped** — created via [CarPlayProjectionBackend.wrapping] around a
+ *    controller the host activity owns (the current DiPlay CarPlay flow). The
+ *    backend never closes that controller on its own: a stop request is
+ *    forwarded to the host via [hostStopHandler], and [isSessionActive] keeps
+ *    reporting the truth (`!controller.isClosed()`) until the host really
+ *    stopped it. The host then confirms via
+ *    `ProjectionManager.onBackendSessionStopped(id)` (wired automatically
+ *    through [setSessionStoppedListener]) — only then are shared resources
+ *    released.
  */
 class CarPlayProjectionBackend internal constructor(
     private val sessionFactory: (((CarPlayStatus) -> Unit) -> CarPlayController)?,
@@ -87,11 +92,32 @@ class CarPlayProjectionBackend internal constructor(
     override val state: ProjectionState
         get() = stateStore.state
 
+    /**
+     * Ground truth for arbitration: true while the CarPlay controller (and thus
+     * the real CarPlay session stack) is alive. For a wrapped session this stays
+     * true across a stop *request* until the host actually closed it.
+     */
+    override val isSessionActive: Boolean
+        get() = controller?.let { !it.isClosed() } ?: false
+
     @Volatile
     private var controller: CarPlayController? = null
 
     @Volatile
     private var started = false
+
+    @Volatile
+    private var sessionStoppedListener: Runnable? = null
+
+    /**
+     * Host lifecycle/takeover hook for wrapped sessions: invoked when the
+     * projection layer wants the externally-owned CarPlay session stopped
+     * (e.g. an explicit takeover). The host performs its real shutdown and then
+     * calls [notifySessionStopped]. Null when no host registered a handler —
+     * the backend then simply reports the session as still active.
+     */
+    @Volatile
+    var hostStopHandler: (() -> Unit)? = null
 
     /** The wrapped/created CarPlay controller, for Apple-only surfaces. */
     val carPlayController: CarPlayController?
@@ -103,6 +129,20 @@ class CarPlayProjectionBackend internal constructor(
 
     override fun removeStateListener(listener: ProjectionStateListener) {
         stateStore.removeListener(listener)
+    }
+
+    override fun setSessionStoppedListener(listener: Runnable?) {
+        sessionStoppedListener = listener
+    }
+
+    /**
+     * The host reports that its externally-owned session has actually stopped
+     * (after [hostStopHandler] or its own teardown). Releases the arbitration
+     * hold via the registered session-stopped listener.
+     */
+    fun notifySessionStopped() {
+        logger.log("backend=$ID host-confirmed-session-stopped")
+        sessionStoppedListener?.run()
     }
 
     /** Wraps an externally-owned controller (wrapped mode). */
@@ -167,11 +207,37 @@ class CarPlayProjectionBackend internal constructor(
         start()
     }
 
-    override fun disconnect() {
-        logger.log("backend=$ID disconnect")
+    /**
+     * Requests the CarPlay session to stop. Returns true only when the session
+     * is confirmed stopped:
+     *  - owned mode closes the controller and waits for it;
+     *  - wrapped mode delegates to [hostStopHandler] and reports `false` until
+     *    the host calls [notifySessionStopped] — shared resources stay claimed
+     *    meanwhile, so no other backend can mistake the hardware for free.
+     */
+    override fun disconnect(): Boolean {
+        logger.log("backend=$ID disconnect requested ownsLifecycle=$ownsLifecycle")
         synchronized(this) { started = false }
-        if (ownsLifecycle) closeController()
-        stateStore.publish(ProjectionState.Idle)
+        return if (ownsLifecycle) {
+            closeController()
+            stateStore.publish(ProjectionState.Idle)
+            true
+        } else {
+            if (stateStore.state is ProjectionState.Connected) {
+                stateStore.publish(ProjectionState.Disconnecting)
+            }
+            val handler = hostStopHandler
+            if (handler != null) {
+                try {
+                    handler()
+                } catch (error: Exception) {
+                    logger.log("backend=$ID host-stop-failed ${error.javaClass.simpleName}")
+                }
+            }
+            // Truthful answer: the wrapped session is alive until its host
+            // really closed the controller.
+            !isSessionActive
+        }
     }
 
     override fun onTouchEvent(event: ProjectionTouchEvent): Boolean {
@@ -198,7 +264,10 @@ class CarPlayProjectionBackend internal constructor(
     }
 
     override fun close() {
-        disconnect()
+        if (ownsLifecycle) {
+            closeController()
+        }
+        stateStore.publish(ProjectionState.Idle)
     }
 
     private fun sendContacts(session: CarPlayController, contacts: List<AirPlayContact>): Boolean =

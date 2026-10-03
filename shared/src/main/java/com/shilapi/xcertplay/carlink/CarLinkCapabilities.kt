@@ -1,11 +1,14 @@
 package com.shilapi.xcertplay.carlink
 
+import com.shilapi.xcertplay.projection.ProjectionResource
+import com.shilapi.xcertplay.projection.ProjectionTransport
+
 /**
  * Capability profile for an ICCOA CarLink session.
  *
  * Values describe what the CarLink framework targets (Xiaomi CarWith,
  * vivo Jovi InCar, OPPO Car+ over ICCOA CarLink); they are NOT a compatibility
- * claim — see the README note on testing.
+ * claim — see docs/MULTI_PROJECTION.md.
  */
 object CarLinkCapabilities {
     /** Video codecs the CarLink framework is prepared to negotiate. */
@@ -33,4 +36,44 @@ object CarLinkCapabilities {
     val targetEcosystems = listOf("Xiaomi CarWith", "vivo Jovi InCar", "OPPO Car+")
 
     const val MAX_TOUCH_CONTACTS = 10
+
+    /**
+     * Reserves for future BLE/Bluetooth discovery. Off until the official
+     * protocol requirements are known — never hard-code speculative claims.
+     */
+    const val BLUETOOTH_DISCOVERY_RESERVED = false
+
+    /**
+     * Reserves for a future microphone uplink (voice assistant / calls). Off
+     * until the official protocol requirements are known.
+     */
+    const val MICROPHONE_UPLINK_RESERVED = false
+
+    /**
+     * Shared hardware a CarLink session needs, computed from the negotiated
+     * [transport] instead of a fixed list:
+     *
+     *  - USB CarLink      → USB + AUDIO
+     *  - Wireless CarLink → WIFI + AUDIO
+     *  - unknown          → AUDIO only (link-level resource claimed on connect)
+     *
+     * Reserved capabilities ([BLUETOOTH_DISCOVERY_RESERVED],
+     * [MICROPHONE_UPLINK_RESERVED]) add BLUETOOTH / MICROPHONE when the real
+     * protocol is known to need them.
+     */
+    fun resourcesFor(transport: ProjectionTransport): Set<ProjectionResource> {
+        val resources = mutableSetOf(ProjectionResource.AUDIO)
+        when (transport) {
+            ProjectionTransport.USB -> resources.add(ProjectionResource.USB)
+            ProjectionTransport.WIFI,
+            ProjectionTransport.WIFI_DIRECT,
+            ProjectionTransport.WIFI_HOTSPOT,
+            -> resources.add(ProjectionResource.WIFI)
+            ProjectionTransport.BLUETOOTH ->
+                if (BLUETOOTH_DISCOVERY_RESERVED) resources.add(ProjectionResource.BLUETOOTH)
+            ProjectionTransport.UNKNOWN -> Unit
+        }
+        if (MICROPHONE_UPLINK_RESERVED) resources.add(ProjectionResource.MICROPHONE)
+        return resources
+    }
 }
