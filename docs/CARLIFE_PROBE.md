@@ -109,6 +109,19 @@ so CarPlay / CarLife / CarLink share one renderer. The SDK's own
 `FrameDecoder` / `AudioTrack` player are NOT adopted as the final
 architecture.
 
+## Phase 9.1.1 hardening (pre-device)
+
+| Check | Status |
+|---|---|
+| PRE_ARBITRATION_AOA_START | FIXED (initialize never scans/requests/connects USB) |
+| SINGLE_CARLIFE_RECEIVER | YES (one init/receiver per process; captured, idempotent) |
+| CARLIFE_SESSION_FENCING | PASS (token-bound listener instances + unregister/fence-before-bind + registration-replay barrier) |
+| ANDROID_14_DYNAMIC_RECEIVER | PASS (RECEIVER_NOT_EXPORTED on API 33+) |
+| ANDROID_14_CONNECTED_DEVICE_FGS | PASS (connectedDevice type + CHANGE_NETWORK_STATE prerequisite) |
+| ASYNC_TERMINAL_RESOURCE_RELEASE | PASS (detach/version/auth/failure release USB+AUDIO immediately via session-stopped listener) |
+| PROBE_DIAGNOSTICS_REAL_DATA | PASS (real progress/versions; USB VID:PID only) |
+| CARLIFE_PROVIDER_CI_EXPLICIT | PASS (test/lint/assemble + reports in Android checks) |
+
 ## Current probe status
 
 | Check | Status |

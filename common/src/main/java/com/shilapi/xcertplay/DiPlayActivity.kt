@@ -644,17 +644,21 @@ class DiPlayActivity : ComponentActivity() {
      */
     private fun startCarLifeProbe() {
         try {
-            val provider = com.shilapi.xcertplay.carlife.CarLifeV2Provider()
-            carLifeProvider = provider
-            provider.initialize(
-                applicationContext,
-                com.shilapi.xcertplay.carlife.CarLifeProviderConfig(
-                    activityClass = DiPlayActivity::class.java,
-                ),
-            )
-            val backend = com.shilapi.xcertplay.carlife.CarLifeProjectionBackend(provider)
-            carLifeBackendRef = backend
-            ProjectionHost.manager.register(backend)
+            // ONE provider / ONE CarLife.init / ONE backend registration per
+            // process. Start Probe reuses them — never new/re-init.
+            val provider = carLifeProvider ?: com.shilapi.xcertplay.carlife.CarLifeV2Provider().also {
+                it.initialize(
+                    applicationContext,
+                    com.shilapi.xcertplay.carlife.CarLifeProviderConfig(
+                        activityClass = DiPlayActivity::class.java,
+                    ),
+                )
+                carLifeProvider = it
+            }
+            val backend = carLifeBackendRef ?: com.shilapi.xcertplay.carlife.CarLifeProjectionBackend(provider).also {
+                carLifeBackendRef = it
+                ProjectionHost.manager.register(it)
+            }
             ProjectionHost.manager.connect(
                 com.shilapi.xcertplay.projection.ProjectionDevice(
                     id = "carlife-phone",

@@ -55,6 +55,9 @@ interface CarLifeReceiver: CarLifeContext {
 
     fun stopConnect()
 
+    /** DiPlay lifecycle extension (Phase 9.1.1): permanently fences this receiver's transport - no auto-reconnect after stop. */
+    fun shutdown()
+
     fun disconnect()
 
     fun ready()

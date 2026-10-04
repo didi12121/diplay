@@ -17,18 +17,42 @@ class GroupedProtocolTransport(private val context: CarLifeContext) :
 
     private var messageDispatcher: MessageDispatcher? = null
 
+    /**
+     * DiPlay lifecycle extension (Phase 9.1.1, host-local only): when set,
+     * the detach auto-reconnect never runs - an old connection attempt can
+     * never come back after its session was stopped. An explicit [connect]
+     * re-enables recovery. No wire-protocol behavior is affected.
+     */
+    @Volatile
+    private var reconnectSuppressed = false
+
     init {
         // init transports
         configConnectType()
     }
 
     fun connect() {
+        reconnectSuppressed = false // an explicit connect re-enables recovery
         if (transports.isEmpty()) {
             configConnectType()
         }
         transports.forEach {
             it.connect()
         }
+    }
+
+    /**
+     */
+    /**
+     * DiPlay lifecycle extension (Phase 9.1.1, host-local only): tears the
+     * current attempt down and suppresses the detach auto-reconnect, so an
+     * old connection attempt can never come back after its session was
+     * stopped. A later explicit [connect] re-enables recovery. No
+     * wire-protocol behavior is affected.
+     */
+    fun shutdown() {
+        reconnectSuppressed = true
+        stopConnect()
     }
 
     fun stopConnect() {
@@ -111,7 +135,7 @@ class GroupedProtocolTransport(private val context: CarLifeContext) :
 
             // 连接断开，一秒之后重新连接
             // 如果车机与手机版本不匹配，则不触发重新连接
-            if (context.isVersionSupport) {
+            if (!reconnectSuppressed && context.isVersionSupport) {
                 context.postDelayed({ connect() }, 1000)
             } else {
                 ready()

@@ -34,7 +34,25 @@ interface CarLifeProvider {
     fun stopConnection(token: CarLifeSessionToken)
 
     fun dispose()
+
+    /**
+     * Real protocol diagnostics for the probe panel. USB entries are
+     * VID:PID-only — never serials or personal data.
+     */
+    fun diagnostics(): CarLifeProviderDiagnostics = CarLifeProviderDiagnostics()
 }
+
+/** Real SDK diagnostic snapshot (no user content, no secrets). */
+data class CarLifeProviderDiagnostics(
+    /** "VID:PID xxxx:yyyy" summaries only. */
+    val usbDevices: List<String> = emptyList(),
+    /** CONFIG_PROTOCOL_VERSION the vehicle side is using. */
+    val localProtocolVersion: Int? = null,
+    /** CarLife protocol version reported by the phone, when negotiated. */
+    val phoneCarLifeVersion: Int? = null,
+    /** Raw SDK connection state (CarLifeContext constants 0..3). */
+    val connectionState: Int = 0,
+)
 
 /**
  * Configuration of one CarLife provider instance.

@@ -30,6 +30,13 @@ class UsbAccessoryScanner(
         const val STORAGE_INTERFACE_CLASS = 8
         const val STORAGE_INTERFACE_SUBCLASS = 6
         const val STORAGE_INTERFACE_PROTOCOL = 80
+
+        /**
+         * Export flag for the dynamic USB receiver (unit-testable, no device).
+         * RECEIVER_NOT_EXPORTED = 4 (Context constant, API 33+).
+         */
+        fun receiverFlags(): Int =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) 0x4 else 0
     }
 
     private val usbManager =
@@ -54,10 +61,26 @@ class UsbAccessoryScanner(
     }
 
 
+    /**
+     * Android 14+ (targetSdk 34+) requires an explicit export flag on dynamic
+     * receivers. This receiver only handles system USB broadcasts plus the
+     * app-scoped USB permission reply (delivered via an explicit-package
+     * PendingIntent), so RECEIVER_NOT_EXPORTED is the right choice on API 33+;
+     * older platforms keep the classic registration. [receiverFlags] is unit
+     * testable without a device.
+     */
+    private fun registerReceiverCompat(receiver: BroadcastReceiver, filter: IntentFilter) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.applicationContext.registerReceiver(receiver, filter, receiverFlags())
+        } else {
+            context.applicationContext.registerReceiver(receiver, filter)
+        }
+    }
+
     fun scan() {
         isStopped.set(false)
         // 执行一次scan，不能在主线程
-        context.applicationContext.registerReceiver(this, filter)
+        registerReceiverCompat(this, filter)
         context.io().execute(this)
     }
 
@@ -211,4 +234,3 @@ class UsbAccessoryScanner(
         }
     }
 }
-

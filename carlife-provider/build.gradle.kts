@@ -88,4 +88,5 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:3.14.9")
 
     testImplementation(libs.junit)
+    testImplementation("org.robolectric:robolectric:4.17")
 }

@@ -114,6 +114,8 @@ sealed class CarLifeConnectionEvent {
     data class Established(override val session: CarLifeSessionToken) : CarLifeConnectionEvent()
     data class VersionNotSupported(override val session: CarLifeSessionToken) : CarLifeConnectionEvent()
     data class AuthFailed(override val session: CarLifeSessionToken) : CarLifeConnectionEvent()
+    /** SDK connection progress (0..100). Diagnostic only; NEVER the success criterion. */
+    data class Progress(override val session: CarLifeSessionToken, val progress: Int) : CarLifeConnectionEvent()
     data class Failed(
         override val session: CarLifeSessionToken,
         val message: String,

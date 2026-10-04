@@ -14,33 +14,61 @@ import com.shilapi.xcertplay.projection.ProjectionTouchEvent
 import java.util.concurrent.atomic.AtomicLong
 
 /**
+ * Schedules the probe failure-classification timeout. The timeout ONLY
+ * classifies why a probe never progressed — it never fabricates session
+ * identity, connection state or success, and it never retries/bypasses auth.
+ */
+fun interface CarLifeProbeTimeoutScheduler {
+    /** Returns a handle whose `close()` cancels the timeout. */
+    fun schedule(timeoutMillis: Long, onTimeout: () -> Unit): AutoCloseable
+}
+
+/** Default scheduler: one daemon timer thread. */
+object SystemCarLifeProbeTimeoutScheduler : CarLifeProbeTimeoutScheduler {
+    override fun schedule(timeoutMillis: Long, onTimeout: () -> Unit): AutoCloseable {
+        val timer = java.util.Timer("carlife-probe-timeout", true)
+        val task = object : java.util.TimerTask() {
+            override fun run() {
+                runCatching { onTimeout() }
+            }
+        }
+        timer.schedule(task, timeoutMillis)
+        return AutoCloseable {
+            task.cancel()
+            timer.cancel()
+        }
+    }
+}
+
+/**
  * Third DiPlay projection backend: open CarLife (Baidu CarLife+) over USB AOA,
  * built on the Apache-2.0 CarLife V2.0 SDK imported from Apollo-DuerOS.
  *
- * Phase 9.1 scope — **Compatibility Probe only**:
- *  - real USB session → AOA accessory → CarLife handshake → version
- *    negotiation → authentication → CONNECTION_ESTABLISHED
- *  - NO media adapter yet (video/audio/touch wiring arrives in Phase 9.2 and
- *    must go through the shared `ProjectionVideoSink`/`AudioAccessUnit`
- *    pipeline, not the SDK's own player/decoder).
+ * Phase 9.1 scope — **Compatibility Probe only** (no media wiring).
  *
  * State mapping (never reports Connected early):
  * ```
- * USB/AOA negotiating          -> Connecting
- * CONNECTION_ESTABLISHED       -> Connected
- * version rejected             -> Error (PROTOCOL_VERSION)
- * auth/channel failed          -> Error (AUTHENTICATION_FAILED)
- * disconnect in progress       -> Disconnecting
- * detached                     -> Ready
+ * AOA / protocol negotiating      -> Connecting
+ * CONNECTION_ESTABLISHED          -> Connected (exactly once)
+ * version rejected                -> Error (PROTOCOL_VERSION)
+ * auth/channel failed             -> Error (AUTHENTICATION_FAILED)
+ * disconnect in progress          -> Disconnecting
+ * detached                        -> Ready
  * ```
  *
- * Session identity: every connect attempt mints a [CarLifeSessionToken];
- * callbacks of older attempts are ignored by identity comparison (see
- * [CarLifeProvider]) — the CarLink stale-callback lesson, applied from day one
- * (and kept separate from `CarLinkSessionToken`).
+ * Diagnostics come from the REAL SDK (ConnectProgressListener progress,
+ * protocol/carlife versions, VID:PID-only USB summaries). Progress numbers are
+ * diagnostic only — success is exclusively `CONNECTION_ESTABLISHED`.
+ *
+ * Resource lease: every terminal outcome (detach, version reject, auth
+ * failure, transport failure) confirms the session stopped via the manager's
+ * session-stopped listener, so USB/AUDIO leases are released immediately —
+ * never left to the next connect's stale-claim sweep.
  */
 class CarLifeProjectionBackend(
     private val provider: CarLifeProvider,
+    private val timeoutScheduler: CarLifeProbeTimeoutScheduler = SystemCarLifeProbeTimeoutScheduler,
+    private val probeTimeoutMillis: Long = DEFAULT_PROBE_TIMEOUT_MILLIS,
 ) : ProjectionBackend {
 
     override val id: String = ID
@@ -68,6 +96,12 @@ class CarLifeProjectionBackend(
     @Volatile
     private var probeReport = CarLifeProbeReport()
 
+    @Volatile
+    private var sessionStoppedListener: Runnable? = null
+
+    @Volatile
+    private var probeTimeout: AutoCloseable? = null
+
     override val state: ProjectionState
         get() = stateStore.state
 
@@ -78,6 +112,10 @@ class CarLifeProjectionBackend(
 
     override fun removeStateListener(listener: ProjectionStateListener) = stateStore.removeListener(listener)
 
+    override fun setSessionStoppedListener(listener: Runnable?) {
+        sessionStoppedListener = listener
+    }
+
     override fun initialize() {
         // The provider is initialized by the host (it needs an Activity class
         // and the application context); nothing else to prepare per probe.
@@ -85,8 +123,7 @@ class CarLifeProjectionBackend(
 
     override fun start() {
         // No discovery step for wired AOA: the phone appears as a USB
-        // accessory. Reports a discoverable device so the manager's AUTO
-        // selection can see CarLife as a candidate.
+        // accessory after the (arbitrated) connect starts the transport.
     }
 
     override fun stop() {
@@ -98,7 +135,7 @@ class CarLifeProjectionBackend(
 
     override fun resolveConnectDevice(requested: ProjectionDevice?): ProjectionDevice? {
         // Wired AOA has no peer-device discovery concept: the phone attaches
-        // itself. There is nothing to resolve — resources are fixed (USB+AUDIO).
+        // itself. Nothing to resolve — resources are fixed (USB+AUDIO).
         return requested
     }
 
@@ -112,13 +149,22 @@ class CarLifeProjectionBackend(
         activeSession = token
         connectPending = true
         probeReport = CarLifeProbeReport(
-            state = CarLifeProbeState.AOA_SWITCH_REQUESTED,
+            state = CarLifeProbeState.USB_DEVICE_FOUND,
             blocker = CarLifeBlocker.NO_REAL_DEVICE,
             session = token.value,
         )
         stateStore.publish(ProjectionState.Connecting)
         try {
             provider.startConnection(token, ::onConnectionEvent)
+            // Real diagnostics from the SDK (VID:PID only; no serials).
+            provider.diagnostics().let { diag ->
+                probeReport = probeReport.copy(
+                    usbDevice = diag.usbDevices.joinToString().ifEmpty { null },
+                    protocolVersion = diag.localProtocolVersion,
+                )
+            }
+            probeReport = probeReport.copy(state = CarLifeProbeState.AOA_SWITCH_REQUESTED)
+            armProbeTimeout(token)
         } catch (error: Exception) {
             connectPending = false
             activeSession = null
@@ -155,6 +201,7 @@ class CarLifeProjectionBackend(
     }
 
     override fun close() {
+        cancelProbeTimeout()
         runCatching { provider.dispose() }
         isSessionActive = false
         connectPending = false
@@ -173,21 +220,37 @@ class CarLifeProjectionBackend(
         }
         when (event) {
             is CarLifeConnectionEvent.Attached -> {
+                // AOA attach observed — from here the timeout classifies as
+                // AOA_COMPATIBILITY gone (progress continues).
+                cancelProbeTimeout()
                 probeReport = probeReport.copy(
                     state = CarLifeProbeState.AOA_ATTACHED,
                     aoaState = "attached",
                     connectionState = 1,
                 )
+                armProbeTimeout(current)
                 stateStore.publish(ProjectionState.Connecting)
             }
             is CarLifeConnectionEvent.Reattached -> {
                 probeReport = probeReport.copy(state = CarLifeProbeState.AOA_ATTACHED, aoaState = "reattached")
                 stateStore.publish(ProjectionState.Connecting)
             }
+            is CarLifeConnectionEvent.Progress -> {
+                // Real SDK progress: 0 -> protocol request, 30 -> version
+                // accepted, ~70 -> auth completed. NEVER a success criterion —
+                // Connected comes only from CONNECTION_ESTABLISHED.
+                val stage = when {
+                    event.progress < 30 -> CarLifeProbeState.PROTOCOL_NEGOTIATING
+                    event.progress < 70 -> CarLifeProbeState.PROTOCOL_ACCEPTED
+                    else -> CarLifeProbeState.AUTHENTICATING
+                }
+                probeReport = probeReport.copy(state = stage)
+            }
             is CarLifeConnectionEvent.Established -> {
-                // REAL success only at CONNECTION_ESTABLISHED (not at AOA, not
-                // at USB detection). Reports Connected exactly once.
+                // REAL success only at CONNECTION_ESTABLISHED. Reports
+                // Connected exactly once.
                 if (isSessionActive) return
+                cancelProbeTimeout()
                 connectPending = false
                 isSessionActive = true
                 probeReport = probeReport.copy(
@@ -195,6 +258,8 @@ class CarLifeProjectionBackend(
                     blocker = CarLifeBlocker.NONE,
                     connectionState = 3,
                     authResult = "accepted",
+                    protocolVersion = provider.diagnostics().localProtocolVersion ?: probeReport.protocolVersion,
+                    phoneCarLifeVersion = provider.diagnostics().phoneCarLifeVersion?.toString(),
                 )
                 stateStore.publish(ProjectionState.Connected)
             }
@@ -228,12 +293,19 @@ class CarLifeProjectionBackend(
         }
     }
 
+    /**
+     * Terminal outcome of the current attempt: cancels the watchdog, clears
+     * session state, publishes the mapped state and — critically — confirms
+     * the session stopped so the manager releases the USB/AUDIO lease
+     * immediately (never waiting for the next connect's sweep).
+     */
     private fun finishSession(
         probeState: CarLifeProbeState,
         blocker: CarLifeBlocker,
         errorCode: ProjectionErrorCode? = null,
         message: String? = null,
     ) {
+        cancelProbeTimeout()
         connectPending = false
         isSessionActive = false
         probeReport = probeReport.copy(state = probeState, blocker = blocker)
@@ -242,6 +314,31 @@ class CarLifeProjectionBackend(
         } else {
             stateStore.publish(ProjectionState.Ready)
         }
+        // Terminal cleanup: the session is confirmed stopped NOW.
+        sessionStoppedListener?.run()
+    }
+
+    /** Classification-only watchdog (never fabricates state or identity). */
+    private fun armProbeTimeout(token: CarLifeSessionToken) {
+        cancelProbeTimeout()
+        probeTimeout = timeoutScheduler.schedule(probeTimeoutMillis) {
+            if (activeSession != token) return@schedule
+            if (isSessionActive) return@schedule
+            // Classify why the probe never reached AOA attach.
+            val usbSeen = probeReport.usbDevice != null
+            val blocker = if (usbSeen) CarLifeBlocker.AOA_COMPATIBILITY else CarLifeBlocker.NO_REAL_DEVICE
+            finishSession(
+                CarLifeProbeState.ERROR,
+                blocker = blocker,
+                errorCode = ProjectionErrorCode.TIMEOUT,
+                message = "CarLife probe timed out waiting for AOA attach",
+            )
+        }
+    }
+
+    private fun cancelProbeTimeout() {
+        probeTimeout?.let { runCatching { it.close() } }
+        probeTimeout = null
     }
 
     private fun publishError(code: ProjectionErrorCode, message: String) {
@@ -250,5 +347,6 @@ class CarLifeProjectionBackend(
 
     companion object {
         const val ID = "carlife"
+        const val DEFAULT_PROBE_TIMEOUT_MILLIS = 15_000L
     }
 }

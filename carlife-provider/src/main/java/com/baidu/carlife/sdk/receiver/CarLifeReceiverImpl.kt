@@ -177,6 +177,11 @@ class CarLifeReceiverImpl(
     /**
      *  车机端发起断开连接，并且停止连接过程
      */
+    /** DiPlay lifecycle extension: permanent transport fence (see GroupedProtocolTransport.shutdown). */
+    override fun shutdown() {
+        transport.shutdown()
+    }
+
     override fun stopConnect() {
         transport.stopConnect()
     }
