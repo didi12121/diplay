@@ -44,31 +44,25 @@ object SystemCarLifeProbeTimeoutScheduler : CarLifeProbeTimeoutScheduler {
  * Third DiPlay projection backend: open CarLife (Baidu CarLife+) over USB AOA,
  * built on the Apache-2.0 CarLife V2.0 SDK imported from Apollo-DuerOS.
  *
- * Phase 9.1 scope — **Compatibility Probe only** (no media wiring).
+ * Phase 9.2a adds REAL VIDEO: protocol video flows through the CarLife video
+ * seam ([CarLifeVideoBridge] / [CarLifeVideoListener]) into
+ * `ProjectionVideoConfig`/`ProjectionVideoFrame` and the SHARED
+ * `AndroidMediaSink` — the upstream SDK's own FrameDecoder is bypassed
+ * (`CONFIG_EXTERNAL_VIDEO_SINK` / RAW_BRIDGE_MODE), so there is exactly one
+ * MediaCodec and one Surface owner.
  *
- * State mapping (never reports Connected early):
- * ```
- * AOA / protocol negotiating      -> Connecting
- * CONNECTION_ESTABLISHED          -> Connected (exactly once)
- * version rejected                -> Error (PROTOCOL_VERSION)
- * auth/channel failed             -> Error (AUTHENTICATION_FAILED)
- * disconnect in progress          -> Disconnecting
- * detached                        -> Ready
- * ```
- *
- * Diagnostics come from the REAL SDK (ConnectProgressListener progress,
- * protocol/carlife versions, VID:PID-only USB summaries). Progress numbers are
- * diagnostic only — success is exclusively `CONNECTION_ESTABLISHED`.
- *
- * Resource lease: every terminal outcome (detach, version reject, auth
- * failure, transport failure) confirms the session stopped via the manager's
- * session-stopped listener, so USB/AUDIO leases are released immediately —
- * never left to the next connect's stale-claim sweep.
+ * State mapping stays honest: Connected ONLY at CONNECTION_ESTABLISHED.
+ * Video lifecycle is session-scoped: bridge + sink belong to one
+ * [CarLifeSessionToken]; a late video callback of a dead attempt is dropped
+ * with a `stale-video-*-ignored` diagnostic and never reaches the live
+ * decoder. Media ownership rules: teardown of session A can never close
+ * session B's decoder.
  */
 class CarLifeProjectionBackend(
     private val provider: CarLifeProvider,
     private val timeoutScheduler: CarLifeProbeTimeoutScheduler = SystemCarLifeProbeTimeoutScheduler,
     private val probeTimeoutMillis: Long = DEFAULT_PROBE_TIMEOUT_MILLIS,
+    private val videoSinkProvider: CarLifeVideoSinkProvider? = null,
 ) : ProjectionBackend {
 
     override val id: String = ID
@@ -102,6 +96,15 @@ class CarLifeProjectionBackend(
     @Volatile
     private var probeTimeout: AutoCloseable? = null
 
+    // ---- Video pipeline state (session-scoped) ----
+    private val videoLock = Any()
+    private var videoSink: CarLifeVideoSinkSession? = null
+    private var videoSinkToken: CarLifeSessionToken? = null
+    private var videoFrameCount = 0
+    private var videoConfigCount = 0
+    private var videoBytes = 0L
+    private var keyframeCount = 0
+
     override val state: ProjectionState
         get() = stateStore.state
 
@@ -117,13 +120,12 @@ class CarLifeProjectionBackend(
     }
 
     override fun initialize() {
-        // The provider is initialized by the host (it needs an Activity class
-        // and the application context); nothing else to prepare per probe.
+        // The provider is initialized by the host (needs an Activity class and
+        // the application context).
     }
 
     override fun start() {
-        // No discovery step for wired AOA: the phone appears as a USB
-        // accessory after the (arbitrated) connect starts the transport.
+        // No discovery step for wired AOA.
     }
 
     override fun stop() {
@@ -148,15 +150,19 @@ class CarLifeProjectionBackend(
         val token = CarLifeSessionToken(sessionCounter.incrementAndGet())
         activeSession = token
         connectPending = true
+        videoFrameCount = 0
+        videoConfigCount = 0
+        videoBytes = 0
+        keyframeCount = 0
         probeReport = CarLifeProbeReport(
             state = CarLifeProbeState.USB_DEVICE_FOUND,
             blocker = CarLifeBlocker.NO_REAL_DEVICE,
             session = token.value,
+            ptsSource = CarLifeVideoFraming.PTS_SOURCE,
         )
         stateStore.publish(ProjectionState.Connecting)
         try {
             provider.startConnection(token, ::onConnectionEvent)
-            // Real diagnostics from the SDK (VID:PID only; no serials).
             provider.diagnostics().let { diag ->
                 probeReport = probeReport.copy(
                     usbDevice = diag.usbDevices.joinToString().ifEmpty { null },
@@ -191,37 +197,36 @@ class CarLifeProjectionBackend(
     }
 
     override fun onTouchEvent(event: ProjectionTouchEvent): Boolean {
-        // Phase 9.2: ProjectionTouchEvent -> CarLife MotionEvent uplink.
+        // Phase 9.2b: touch uplink.
         return false
     }
 
     override fun onKeyEvent(event: ProjectionKeyEvent): Boolean {
-        // Phase 9.2: key uplink via CarLife.receiver().onKeyEvent.
+        // Phase 9.2b: key uplink.
         return false
     }
 
     override fun close() {
         cancelProbeTimeout()
+        val token = activeSession
+        provider.detachVideo(token ?: CarLifeSessionToken(-1))
+        closeVideoSink(token)
         runCatching { provider.dispose() }
         isSessionActive = false
         connectPending = false
         activeSession = null
     }
 
-    // ---- Session events (token-checked; the provider tags every callback) ----
+    // ---- Session events (token-checked; provider tags every callback) ----
 
     private fun onConnectionEvent(event: CarLifeConnectionEvent) {
         val current = activeSession
         if (current == null || event.session != current) {
-            // Stale callback of a dead attempt: identity comparison, never
-            // ordering heuristics. A late event cannot pollute the new probe.
             probeReport = probeReport.copy(lastError = "stale-session-callback-ignored:${event::class.simpleName}")
             return
         }
         when (event) {
             is CarLifeConnectionEvent.Attached -> {
-                // AOA attach observed — from here the timeout classifies as
-                // AOA_COMPATIBILITY gone (progress continues).
                 cancelProbeTimeout()
                 probeReport = probeReport.copy(
                     state = CarLifeProbeState.AOA_ATTACHED,
@@ -236,9 +241,6 @@ class CarLifeProjectionBackend(
                 stateStore.publish(ProjectionState.Connecting)
             }
             is CarLifeConnectionEvent.Progress -> {
-                // Real SDK progress: 0 -> protocol request, 30 -> version
-                // accepted, ~70 -> auth completed. NEVER a success criterion —
-                // Connected comes only from CONNECTION_ESTABLISHED.
                 val stage = when {
                     event.progress < 30 -> CarLifeProbeState.PROTOCOL_NEGOTIATING
                     event.progress < 70 -> CarLifeProbeState.PROTOCOL_ACCEPTED
@@ -247,8 +249,6 @@ class CarLifeProjectionBackend(
                 probeReport = probeReport.copy(state = stage)
             }
             is CarLifeConnectionEvent.Established -> {
-                // REAL success only at CONNECTION_ESTABLISHED. Reports
-                // Connected exactly once.
                 if (isSessionActive) return
                 cancelProbeTimeout()
                 connectPending = false
@@ -258,9 +258,10 @@ class CarLifeProjectionBackend(
                     blocker = CarLifeBlocker.NONE,
                     connectionState = 3,
                     authResult = "accepted",
-                    protocolVersion = provider.diagnostics().localProtocolVersion ?: probeReport.protocolVersion,
-                    phoneCarLifeVersion = provider.diagnostics().phoneCarLifeVersion?.toString(),
+                    phoneCarlifeProtocolVersion = provider.diagnostics().phoneCarlifeProtocolVersion,
                 )
+                // REAL VIDEO: bind the session-scoped video pipeline.
+                openVideoSink(current)
                 stateStore.publish(ProjectionState.Connected)
             }
             is CarLifeConnectionEvent.VersionNotSupported -> {
@@ -294,10 +295,9 @@ class CarLifeProjectionBackend(
     }
 
     /**
-     * Terminal outcome of the current attempt: cancels the watchdog, clears
-     * session state, publishes the mapped state and — critically — confirms
-     * the session stopped so the manager releases the USB/AUDIO lease
-     * immediately (never waiting for the next connect's sweep).
+     * Terminal outcome of the current attempt: cancels the watchdog, closes
+     * THIS session's video path (never a newer one's), clears session state
+     * and confirms the session stopped so the manager releases USB/AUDIO now.
      */
     private fun finishSession(
         probeState: CarLifeProbeState,
@@ -306,16 +306,120 @@ class CarLifeProjectionBackend(
         message: String? = null,
     ) {
         cancelProbeTimeout()
+        val token = activeSession
         connectPending = false
         isSessionActive = false
-        probeReport = probeReport.copy(state = probeState, blocker = blocker)
+        provider.detachVideo(token ?: CarLifeSessionToken(-1))
+        closeVideoSink(token)
+        probeReport = probeReport.copy(
+            state = probeState,
+            blocker = blocker,
+            decoderState = if (errorCode != null) "error" else "stopped",
+        )
         if (errorCode != null) {
             publishError(errorCode, message ?: "CarLife session failed")
         } else {
             stateStore.publish(ProjectionState.Ready)
         }
-        // Terminal cleanup: the session is confirmed stopped NOW.
         sessionStoppedListener?.run()
+    }
+
+    // ---- Video pipeline (session-scoped; identity-bound like the session) ----
+
+    /** Stats + relay into the session's projection sink. */
+    private inner class VideoRelay(
+        private val adapter: CarLifeProjectionVideoAdapter,
+    ) : CarLifeVideoListener {
+        override fun onVideoConfig(session: CarLifeSessionToken, config: CarLifeVideoConfig) {
+            if (session != activeSession) {
+                probeReport = probeReport.copy(lastVideoError = "stale-video-config-ignored")
+                return
+            }
+            videoConfigCount++
+            probeReport = probeReport.copy(
+                videoStage = "VIDEO_CONFIG_RECEIVED",
+                videoCodec = "H264",
+                videoWidth = config.width,
+                videoHeight = config.height,
+                videoConfigCount = videoConfigCount,
+                decoderState = "configured",
+            )
+            adapter.onVideoConfig(session, config)
+        }
+
+        override fun onVideoFrame(session: CarLifeSessionToken, frame: CarLifeVideoFrame) {
+            if (session != activeSession) {
+                probeReport = probeReport.copy(lastVideoError = "stale-video-frame-ignored")
+                return
+            }
+            videoFrameCount++
+            videoBytes += frame.length
+            if (frame.keyFrame) keyframeCount++
+            probeReport = probeReport.copy(
+                videoStage = if (probeReport.firstFrameRendered) {
+                    "FIRST_OUTPUT_FRAME_RENDERED"
+                } else {
+                    "VIDEO_FRAME_QUEUED"
+                },
+                videoFrameCount = videoFrameCount,
+                videoBytes = videoBytes,
+                keyframeCount = keyframeCount,
+                lastFrameAgeMs = 0,
+                decoderState = if (probeReport.firstFrameRendered) "rendering" else "decoding",
+            )
+            adapter.onVideoFrame(session, frame)
+        }
+
+        override fun onVideoStopped(session: CarLifeSessionToken) {
+            if (session != activeSession) {
+                probeReport = probeReport.copy(lastVideoError = "stale-video-stop-ignored")
+                return
+            }
+            probeReport = probeReport.copy(decoderState = "stopped")
+            adapter.onVideoStopped(session)
+        }
+    }
+
+    private fun openVideoSink(token: CarLifeSessionToken) {
+        val sinkProvider = videoSinkProvider ?: return
+        try {
+            val sessionSink = sinkProvider.acquire(::onDecoderDiagnostic)
+            val adapter = CarLifeProjectionVideoAdapter(sessionSink.video)
+            synchronized(videoLock) {
+                videoSink = sessionSink
+                videoSinkToken = token
+            }
+            provider.attachVideo(token, VideoRelay(adapter))
+            probeReport = probeReport.copy(videoStage = "VIDEO_PIPELINE_OPEN", decoderState = "waiting")
+        } catch (error: Exception) {
+            probeReport = probeReport.copy(
+                lastVideoError = error.javaClass.simpleName,
+                decoderState = "error",
+            )
+        }
+    }
+
+    private fun closeVideoSink(token: CarLifeSessionToken?) {
+        val toClose: CarLifeVideoSinkSession?
+        synchronized(videoLock) {
+            // Only the owning session may close its media path. A teardown of
+            // session A can never close session B's decoder.
+            if (token != null && videoSinkToken != null && token != videoSinkToken) return
+            toClose = videoSink
+            videoSink = null
+            videoSinkToken = null
+        }
+        runCatching { toClose?.close() }
+    }
+
+    /** Shared-decoder diagnostics (e.g. "first frame rendered"). */
+    private fun onDecoderDiagnostic(message: String) {
+        val rendered = message.contains("first frame rendered")
+        probeReport = probeReport.copy(
+            decoderState = if (rendered) "rendering" else probeReport.decoderState,
+            firstFrameRendered = probeReport.firstFrameRendered || rendered,
+            videoStage = if (rendered) "FIRST_OUTPUT_FRAME_RENDERED" else probeReport.videoStage,
+        )
     }
 
     /** Classification-only watchdog (never fabricates state or identity). */
@@ -324,7 +428,6 @@ class CarLifeProjectionBackend(
         probeTimeout = timeoutScheduler.schedule(probeTimeoutMillis) {
             if (activeSession != token) return@schedule
             if (isSessionActive) return@schedule
-            // Classify why the probe never reached AOA attach.
             val usbSeen = probeReport.usbDevice != null
             val blocker = if (usbSeen) CarLifeBlocker.AOA_COMPATIBILITY else CarLifeBlocker.NO_REAL_DEVICE
             finishSession(

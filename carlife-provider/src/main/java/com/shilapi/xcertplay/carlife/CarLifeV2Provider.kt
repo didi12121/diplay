@@ -20,6 +20,8 @@ import com.baidu.carlife.sdk.receiver.ConnectProgressListener
 interface CarLifeReceiverFacade {
     fun addConnectionListener(listener: ConnectionChangeListener)
     fun removeConnectionListener(listener: ConnectionChangeListener)
+    fun addTransportListener(listener: com.baidu.carlife.sdk.internal.transport.TransportListener) {}
+    fun removeTransportListener(listener: com.baidu.carlife.sdk.internal.transport.TransportListener) {}
     fun addProgressListener(listener: ConnectProgressListener)
     fun removeProgressListener(listener: ConnectProgressListener)
     fun connect()
@@ -109,6 +111,7 @@ class CarLifeV2Provider(
             //    contains it, so no further callback can reach the old sink;
             runCatching { facade.removeConnectionListener(old.listener) }
             runCatching { facade.removeProgressListener(old.progress) }
+            detachVideo(old.token)
             // 2. fence the old transport: tear its attempt down AND suppress
             //    the detach auto-reconnect so it can never come back.
             runCatching { facade.shutdown() }
@@ -142,12 +145,28 @@ class CarLifeV2Provider(
         return CarLifeProviderDiagnostics(
             usbDevices = runCatching { facade.usbDeviceSummaries() }.getOrDefault(emptyList()),
             localProtocolVersion = runCatching { facade.protocolVersion() }.getOrNull(),
-            phoneCarLifeVersion = runCatching { facade.carlifeVersion() }.getOrNull(),
+            phoneCarlifeProtocolVersion = runCatching { facade.carlifeVersion() }.getOrNull(),
             connectionState = runCatching { facade.connectionState() }.getOrDefault(0),
         )
     }
 
+    private val videoBridges = java.util.concurrent.ConcurrentHashMap<CarLifeSessionToken, CarLifeVideoBridge>()
+
+    override fun attachVideo(token: CarLifeSessionToken, video: CarLifeVideoListener) {
+        val facade = facade ?: return
+        val bridge = CarLifeVideoBridge(token, video)
+        videoBridges[token] = bridge
+        runCatching { facade.addTransportListener(bridge) }
+    }
+
+    override fun detachVideo(token: CarLifeSessionToken) {
+        val facade = facade ?: return
+        val bridge = videoBridges.remove(token) ?: return
+        runCatching { facade.removeTransportListener(bridge) }
+    }
+
     override fun dispose() {
+        videoBridges.keys.toList().forEach { detachVideo(it) }
         val facade = facade ?: return
         val current = synchronized(lock) { attempt.also { attempt = null } }
         if (current != null) {
@@ -228,6 +247,12 @@ class CarLifeV2Provider(
 
         override fun removeConnectionListener(listener: ConnectionChangeListener) =
             receiver.unregisterConnectionChangeListener(listener)
+
+        override fun addTransportListener(listener: com.baidu.carlife.sdk.internal.transport.TransportListener) =
+            receiver.registerTransportListener(listener)
+
+        override fun removeTransportListener(listener: com.baidu.carlife.sdk.internal.transport.TransportListener) =
+            receiver.unregisterTransportListener(listener)
 
         override fun addProgressListener(listener: ConnectProgressListener) =
             receiver.addConnectProgressListener(listener)

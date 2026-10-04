@@ -22,7 +22,7 @@ class CarLifeTerminalReleaseTest {
         var diagnostics = CarLifeProviderDiagnostics(
             usbDevices = listOf("VID:PID 18d1:4ee1"),
             localProtocolVersion = 4,
-            phoneCarLifeVersion = 3,
+            phoneCarlifeProtocolVersion = 3,
         )
 
         override fun initialize(context: android.content.Context, config: CarLifeProviderConfig) {}

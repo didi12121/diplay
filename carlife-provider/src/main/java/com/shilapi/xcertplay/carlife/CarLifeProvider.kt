@@ -33,6 +33,14 @@ interface CarLifeProvider {
     /** Cancels/tears down the attempt of [token] (idempotent). */
     fun stopConnection(token: CarLifeSessionToken)
 
+    /**
+     * Binds a session-scoped video listener to one attempt's transport
+     * messages. Implementations must fence it together with the attempt.
+     */
+    fun attachVideo(token: CarLifeSessionToken, video: CarLifeVideoListener) {}
+
+    fun detachVideo(token: CarLifeSessionToken) {}
+
     fun dispose()
 
     /**
@@ -49,7 +57,7 @@ data class CarLifeProviderDiagnostics(
     /** CONFIG_PROTOCOL_VERSION the vehicle side is using. */
     val localProtocolVersion: Int? = null,
     /** CarLife protocol version reported by the phone, when negotiated. */
-    val phoneCarLifeVersion: Int? = null,
+    val phoneCarlifeProtocolVersion: Int? = null,
     /** Raw SDK connection state (CarLifeContext constants 0..3). */
     val connectionState: Int = 0,
 )

@@ -91,13 +91,34 @@ data class CarLifeProbeReport(
     /** CONFIG_PROTOCOL_VERSION sent during negotiation. */
     val protocolVersion: Int? = null,
     /** CarLife version reported by the phone, when known. */
-    val phoneCarLifeVersion: String? = null,
+    /**
+     * CarLife protocol version reported by the phone (ProtocolVersionMatch:
+     * CarLifeContext.carlifeVersion = versionStatus.carlifeProtocolVersion).
+     * 0 = not reported by the phone - this is NOT a phone app version.
+     */
+    val phoneCarlifeProtocolVersion: Int? = null,
     val authResult: String? = null,
     val lastError: String? = null,
     /** Projection resources currently held by the CarLife backend. */
     val heldResources: Set<com.shilapi.xcertplay.projection.ProjectionResource> = emptySet(),
     /** Session token of the current probe attempt (identity, not secret). */
     val session: Long? = null,
+    // ---- Video pipeline diagnostics (real data only) ----
+    /** VIDEO_CONFIG_RECEIVED -> VIDEO_FRAME_RECEIVED -> VIDEO_FRAME_QUEUED ->
+     *  VIDEO_DECODER_STARTED -> FIRST_OUTPUT_FRAME_RENDERED */
+    val videoStage: String = "idle",
+    val videoCodec: String? = null,
+    val videoWidth: Int? = null,
+    val videoHeight: Int? = null,
+    val videoConfigCount: Int = 0,
+    val videoFrameCount: Int = 0,
+    val videoBytes: Long = 0,
+    val keyframeCount: Int = 0,
+    val lastFrameAgeMs: Long? = null,
+    val ptsSource: String = "HOST_RECEIVE_SYNTHETIC",
+    val decoderState: String = "idle",
+    val firstFrameRendered: Boolean = false,
+    val lastVideoError: String? = null,
 )
 
 /**

@@ -50,6 +50,15 @@ public class Configs {
     public static final String CONFIG_USE_ASYNC_USB_MODE = "CONFIG_USE_ASYNC_USB_MODE";
 
     /**
+     * DiPlay host-local flag (Phase 9.2a): when true, the upstream
+     * RemoteDisplayRenderer does NOT create/decode with its own FrameDecoder
+     * ("RAW_BRIDGE_MODE"): protocol video messages are forwarded to an
+     * external host video sink instead. Affects ONLY the local render
+     * path - never the wire protocol, never anything phone-visible.
+     */
+    public static final String CONFIG_EXTERNAL_VIDEO_SINK = "CONFIG_EXTERNAL_VIDEO_SINK";
+
+    /**
      * 配置蓝牙名称及MAC地址
      */
     public static final String CONFIG_HU_BT_NAME = "CONFIG_HU_BT_NAME";

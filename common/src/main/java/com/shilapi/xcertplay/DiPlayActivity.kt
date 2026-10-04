@@ -610,6 +610,7 @@ class DiPlayActivity : ComponentActivity() {
 
     private var carLifeProvider: com.shilapi.xcertplay.carlife.CarLifeV2Provider? = null
     private var carLifeBackendRef: com.shilapi.xcertplay.carlife.CarLifeProjectionBackend? = null
+    private var carLifeSessionLaunched = false
     private var carLifeProbeStatus: TextView? = null
 
     private fun carLifePanel(content: LinearLayout) {
@@ -655,7 +656,10 @@ class DiPlayActivity : ComponentActivity() {
                 )
                 carLifeProvider = it
             }
-            val backend = carLifeBackendRef ?: com.shilapi.xcertplay.carlife.CarLifeProjectionBackend(provider).also {
+            val backend = carLifeBackendRef ?: com.shilapi.xcertplay.carlife.CarLifeProjectionBackend(
+                provider,
+                videoSinkProvider = AndroidCarLifeVideoSinkProvider(ProjectionHost.display, applicationContext),
+            ).also {
                 carLifeBackendRef = it
                 ProjectionHost.manager.register(it)
             }
@@ -687,10 +691,20 @@ class DiPlayActivity : ComponentActivity() {
             appendLine("state: ${report.state}  blocker: ${report.blocker}")
             appendLine("USB: ${report.usbDevice ?: "-"}   AOA: ${report.aoaState}")
             appendLine("connection: ${report.connectionState}  protocolVersion: ${report.protocolVersion ?: "-"}")
-            appendLine("phone CarLife: ${report.phoneCarLifeVersion ?: "-"}   auth: ${report.authResult ?: "-"}")
+            appendLine("phone CarLife protocol version: ${report.phoneCarlifeProtocolVersion ?: "0 (not reported)"}   auth: ${report.authResult ?: "-"}")
             appendLine("last error: ${report.lastError ?: "-"}")
             appendLine("held resources: ${if (held.isEmpty()) "-" else held.joinToString(", ")}")
+            appendLine("video: ${report.videoCodec ?: "-"} ${report.videoWidth ?: "-"}x${report.videoHeight ?: "-"}  stage: ${report.videoStage}")
+            appendLine("video stats: cfg=${report.videoConfigCount} frames=${report.videoFrameCount} bytes=${report.videoBytes} keyframes=${report.keyframeCount}")
+            appendLine("pts: ${report.ptsSource}  decoder: ${report.decoderState}  firstFrame: ${report.firstFrameRendered}")
+            appendLine("video error: ${report.lastVideoError ?: "-"}  phone CarLife protocol: ${report.phoneCarlifeProtocolVersion ?: "0 (not reported)"}")
             append("DEMO_CHANNEL — NOT FOR PRODUCTION — COMPATIBILITY UNVERIFIED")
+        }
+        // First real video config -> open the shared projection page
+        // (SurfaceView + shared AndroidMediaSink rendering path).
+        if (!carLifeSessionLaunched && report.videoConfigCount > 0) {
+            carLifeSessionLaunched = true
+            startActivity(ProjectionSessionActivity.createIntent(this, com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID))
         }
     }
     private fun carlinkPanel(content: LinearLayout) {

@@ -4,6 +4,7 @@ import android.view.Surface
 import com.baidu.carlife.protobuf.CarlifeVideoEncoderInfoProto.CarlifeVideoEncoderInfo
 import com.baidu.carlife.sdk.CarLifeContext
 import com.baidu.carlife.sdk.Constants
+import com.baidu.carlife.sdk.Configs.CONFIG_EXTERNAL_VIDEO_SINK
 import com.baidu.carlife.sdk.Constants.MSG_CHANNEL_CMD
 import com.baidu.carlife.sdk.internal.protocol.CarLifeMessage
 import com.baidu.carlife.sdk.internal.protocol.CarLifeMessage.Companion.obtain
@@ -30,8 +31,16 @@ class RemoteDisplayRenderer(private val context: CarLifeContext,
 
     var surfaceRequester: SurfaceRequestCallback? = null
 
+    /** DiPlay RAW_BRIDGE_MODE: see CONFIG_EXTERNAL_VIDEO_SINK. */
+    private val externalVideoSink: Boolean
+
 
     init {
+        // DiPlay RAW_BRIDGE_MODE (Phase 9.2a): external video sink owns
+        // decoding/rendering. This renderer keeps protocol bookkeeping
+        // (encoder info, size notifications, START/PAUSE signalling) but
+        // never creates a FrameDecoder or touches a Surface.
+        externalVideoSink = context.getConfig(CONFIG_EXTERNAL_VIDEO_SINK, false)
         val screenWidth = context.applicationContext.resources.displayMetrics.widthPixels
         val screenHeight = context.applicationContext.resources.displayMetrics.heightPixels
         displaySpec = DisplaySpec(context.applicationContext, screenWidth, screenHeight, 30)
@@ -39,6 +48,10 @@ class RemoteDisplayRenderer(private val context: CarLifeContext,
 
     @Synchronized
     fun setSurface(surface: Surface?) {
+        if (externalVideoSink) {
+            // External sink owns the Surface; nothing to bind here.
+            return
+        }
         this.surface = surface
         if (surface == null) {
             Logger.d(Constants.TAG, "RemoteDisplayRenderer setSurface to null")
@@ -79,8 +92,15 @@ class RemoteDisplayRenderer(private val context: CarLifeContext,
                 synchronized(this) {
                     encoderInfo = message.protoPayload as CarlifeVideoEncoderInfo
                     listener.onVideoSizeChanged(encoderInfo!!.width, encoderInfo!!.height)
+                    if (externalVideoSink) {
+                        // RAW_BRIDGE_MODE: no decoder here; still ask the phone
+                        // to start streaming - the external host video bridge
+                        // consumes MSG_VIDEO_DATA (and this message).
+                        val start = obtain(MSG_CHANNEL_CMD, MSG_CMD_VIDEO_ENCODER_START)
+                        context.postMessage(start)
+                        return true
+                    }
                     if (surface != null) {
-                        frameDecoder = FrameDecoder(context, surface!!, encoderInfo!!)
                         var messgae = obtain(MSG_CHANNEL_CMD, MSG_CMD_VIDEO_ENCODER_START)
                         context.postMessage(messgae)
                         Logger.d(Constants.TAG, "RemoteDisplayRenderer postMessage MSG_CMD_VIDEO_ENCODER_START 1")
@@ -94,6 +114,11 @@ class RemoteDisplayRenderer(private val context: CarLifeContext,
                 return true
             }
             MSG_VIDEO_DATA -> {
+                if (externalVideoSink) {
+                    // RAW_BRIDGE_MODE: an external host video bridge consumes
+                    // this message; do not feed an internal decoder.
+                    return false
+                }
                 if (message.payloadSize != 0) {
                     frameDecoder?.feedFrame(message)
                 }
