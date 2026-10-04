@@ -5,6 +5,7 @@ import com.shilapi.xcertplay.projection.ProjectionAudioCodec
 import com.shilapi.xcertplay.projection.ProjectionDevice
 import com.shilapi.xcertplay.projection.ProjectionKeyEvent
 import com.shilapi.xcertplay.projection.ProjectionMetadata
+import com.shilapi.xcertplay.projection.ProjectionSampleFormat
 import com.shilapi.xcertplay.projection.ProjectionTouchEvent
 import com.shilapi.xcertplay.projection.ProjectionTransport
 import com.shilapi.xcertplay.projection.ProjectionVideoConfig
@@ -49,7 +50,22 @@ data class CarLinkAudioFormat(
     val channels: Int,
     /** Backend wire payload type, kept for diagnostics only. */
     val payloadType: Int = 0,
+    /**
+     * PCM byte order of raw PCM16 payloads. Ignored for AAC/Opus. A real SDK
+     * must declare its endianness here — never assume Apple's big-endian
+     * wired LPCM; the renderer byte-swaps exactly once based on this.
+     */
+    val sampleFormat: ProjectionSampleFormat = ProjectionSampleFormat.PCM_S16_LE,
 )
+
+/** Severity of an asynchronous [CarLinkProtocolListener.onError] report. */
+enum class CarLinkErrorSeverity {
+    /** Temporary failure (e.g. a dropped packet): the session stays alive. */
+    RECOVERABLE,
+
+    /** Session-killing failure (link lost, SDK abort): the session is torn down. */
+    FATAL,
+}
 
 /**
  * One raw audio access unit (or PCM frame) of a CarLink stream.
@@ -104,8 +120,21 @@ interface CarLinkProtocolListener {
     /** Now-playing / navigation metadata update. */
     fun onMetadata(metadata: ProjectionMetadata) {}
 
-    /** The protocol stack reported a failure. */
-    fun onError(code: String, message: String, cause: Throwable?) {}
+    /**
+     * The protocol stack reported a failure.
+     *
+     * [CarLinkErrorSeverity.RECOVERABLE] is logged as a diagnostic and the
+     * session keeps running; [CarLinkErrorSeverity.FATAL] tears the session
+     * down (audio stopped, media sinks closed, resources released) and latches
+     * `ProjectionState.Error` so a later `onSessionEnded` cannot overwrite the
+     * error with a healthy state. When in doubt, report FATAL.
+     */
+    fun onError(
+        code: String,
+        message: String,
+        severity: CarLinkErrorSeverity,
+        cause: Throwable? = null,
+    ) {}
 }
 
 /**

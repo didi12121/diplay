@@ -97,6 +97,7 @@ class CarLinkAudioChannel(
                 channels = format.channels,
                 channel = format.role,
                 payloadType = format.payloadType,
+                sampleFormat = format.sampleFormat,
             ),
         )
         diagnostics.event(

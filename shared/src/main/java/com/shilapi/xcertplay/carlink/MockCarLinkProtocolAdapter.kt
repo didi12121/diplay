@@ -75,7 +75,11 @@ class MockCarLinkProtocolAdapter(
 
     override fun connect(device: CarLinkDevice) {
         if (!initialized) {
-            listener?.onError("PROVIDER_UNAVAILABLE", "mock adapter not initialized", null)
+            listener?.onError(
+                "PROVIDER_UNAVAILABLE",
+                "mock adapter not initialized",
+                CarLinkErrorSeverity.FATAL,
+            )
             return
         }
         stopDiscovery()
@@ -154,8 +158,13 @@ class MockCarLinkProtocolAdapter(
     }
 
     /** Test hook: pushes a fake error through the listener. */
-    fun simulateError(code: String, message: String) {
-        listener?.onError(code, message, null)
+    fun simulateError(
+        code: String,
+        message: String,
+        severity: CarLinkErrorSeverity = CarLinkErrorSeverity.FATAL,
+        cause: Throwable? = null,
+    ) {
+        listener?.onError(code, message, severity, cause)
     }
 
     /** Test hook: pushes a fake adapter exception surface (protocol layer). */
