@@ -87,6 +87,7 @@ class DiPlayActivity : ComponentActivity() {
         override fun run() {
             refreshStatus()
             if (page == "carlink") refreshCarLinkPanel()
+            if (page == "carlife") refreshCarLifeProbe()
             handler.postDelayed(this, 1000)
         }
     }
@@ -212,6 +213,7 @@ class DiPlayActivity : ComponentActivity() {
             "settings" -> settings(content)
             "about" -> about(content)
             "carlink" -> carlinkPanel(content)
+            "carlife" -> carLifePanel(content)
             else -> home(content)
         }
         setContentView(scroll)
@@ -263,6 +265,7 @@ class DiPlayActivity : ComponentActivity() {
         right.addView(button(getString(R.string.connect_with_usb), false) { connect(false) }, matchButton())
         right.addView(label(getString(R.string.plug_your_iphone_into_a_usb_data_port_allow_carplay_when_y), 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(24)) })
         right.addView(button(getString(R.string.phone_projection), false) { page = "carlink"; render() }, matchButton())
+        right.addView(button("CarLife (USB probe)", false) { page = "carlife"; render() }, matchButton())
         right.addView(label(getString(R.string.carlink_framework), 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(24)) })
         right.addView(button(getString(R.string.settings), false) { page = "settings"; render() }, matchButton())
         right.addView(label(getString(R.string.make_diplay_feel_right_for_your_car), 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(0, dp(10), 0, dp(24)) })
@@ -603,6 +606,89 @@ class DiPlayActivity : ComponentActivity() {
      * integrated yet, so the panel drives a Mock protocol adapter and shows the
      * real provider state instead of pretending a phone is connected.
      */
+    // ---- Android CarLife (USB AOA) Compatibility Probe (Phase 9.1) ----
+
+    private var carLifeProvider: com.shilapi.xcertplay.carlife.CarLifeV2Provider? = null
+    private var carLifeBackendRef: com.shilapi.xcertplay.carlife.CarLifeProjectionBackend? = null
+    private var carLifeProbeStatus: TextView? = null
+
+    private fun carLifePanel(content: LinearLayout) {
+        section(content, "Android CarLife — USB AOA Compatibility Probe") { card ->
+            if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0) {
+                // Release builds never expose the developer probe.
+                card.addView(TextView(this).apply { this.text = "CarLife probe is available in debug builds only." })
+                return@section
+            }
+            val status = TextView(this).apply {
+                setTextColor(0xFFDDDDDD.toInt())
+                textSize = 13f
+                setPadding(dp(6), dp(8), dp(6), dp(8))
+            }
+            carLifeProbeStatus = status
+            card.addView(status, matchButton(4, -2))
+            card.addView(button("Developer: CarLife USB Probe — start", false) {
+                startCarLifeProbe()
+            }, matchButton(10, 60))
+            card.addView(button("Developer: CarLife probe — disconnect", false) {
+                ProjectionHost.manager.disconnectBackend(com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID)
+                refreshCarLifeProbe()
+            }, matchButton(6, 60))
+            refreshCarLifeProbe()
+        }
+    }
+
+    /**
+     * Debug-only probe: initializes the open CarLife V2 provider with the
+     * PUBLIC demo configuration (DEMO_CHANNEL — NOT FOR PRODUCTION —
+     * COMPATIBILITY UNVERIFIED) and starts one wired-AOA connect attempt.
+     */
+    private fun startCarLifeProbe() {
+        try {
+            val provider = com.shilapi.xcertplay.carlife.CarLifeV2Provider()
+            carLifeProvider = provider
+            provider.initialize(
+                applicationContext,
+                com.shilapi.xcertplay.carlife.CarLifeProviderConfig(
+                    activityClass = DiPlayActivity::class.java,
+                ),
+            )
+            val backend = com.shilapi.xcertplay.carlife.CarLifeProjectionBackend(provider)
+            carLifeBackendRef = backend
+            ProjectionHost.manager.register(backend)
+            ProjectionHost.manager.connect(
+                com.shilapi.xcertplay.projection.ProjectionDevice(
+                    id = "carlife-phone",
+                    name = "Android phone (CarLife)",
+                    backendId = com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID,
+                ),
+            )
+        } catch (conflict: com.shilapi.xcertplay.projection.ProjectionResourceConflictException) {
+            toast(getString(R.string.carlink_resource_busy))
+        } catch (error: Exception) {
+            toast("CarLife probe failed: ${error.javaClass.simpleName}")
+        }
+        refreshCarLifeProbe()
+    }
+
+    /** Renders protocol diagnostics only — never user content or secrets. */
+    private fun refreshCarLifeProbe() {
+        val status = carLifeProbeStatus ?: return
+        val backend = carLifeBackendRef ?: run {
+            status.text = "probe idle — press start"
+            return
+        }
+        val report = backend.probeReport()
+        val held = ProjectionHost.manager.resourcesHeldBy(com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID)
+        status.text = buildString {
+            appendLine("state: ${report.state}  blocker: ${report.blocker}")
+            appendLine("USB: ${report.usbDevice ?: "-"}   AOA: ${report.aoaState}")
+            appendLine("connection: ${report.connectionState}  protocolVersion: ${report.protocolVersion ?: "-"}")
+            appendLine("phone CarLife: ${report.phoneCarLifeVersion ?: "-"}   auth: ${report.authResult ?: "-"}")
+            appendLine("last error: ${report.lastError ?: "-"}")
+            appendLine("held resources: ${if (held.isEmpty()) "-" else held.joinToString(", ")}")
+            append("DEMO_CHANNEL — NOT FOR PRODUCTION — COMPATIBILITY UNVERIFIED")
+        }
+    }
     private fun carlinkPanel(content: LinearLayout) {
         content.addView(label(getString(R.string.phone_projection), 34, TEXT, true))
         content.addView(label(getString(R.string.carlink_not_verified), 17, MUTED).apply { setPadding(0, dp(8), 0, dp(24)) })

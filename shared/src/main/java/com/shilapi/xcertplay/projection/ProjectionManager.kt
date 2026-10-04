@@ -5,6 +5,7 @@ enum class ProjectionMode {
     /** Prefer whichever backend reports a device first. */
     AUTO,
     CARPLAY,
+    CARLIFE,
     CARLINK,
 }
 
@@ -168,6 +169,7 @@ class ProjectionManager(
             when (mode) {
                 ProjectionMode.AUTO -> pickAuto()
                 ProjectionMode.CARPLAY -> backends[CARPLAY_ID]
+                ProjectionMode.CARLIFE -> backends[CARLIFE_ID]
                 ProjectionMode.CARLINK -> backends[CARLINK_ID]
             }
         }
@@ -462,6 +464,7 @@ class ProjectionManager(
         val all = registeredBackends
         return all.firstOrNull { it.isSessionActive }
             ?: backend(CARPLAY_ID)
+            ?: backend(CARLIFE_ID)
             ?: backend(CARLINK_ID)
             ?: all.firstOrNull()
     }
@@ -478,6 +481,7 @@ class ProjectionManager(
 
     companion object {
         const val CARPLAY_ID = "carplay"
+        const val CARLIFE_ID = "carlife"
         const val CARLINK_ID = "carlink"
     }
 }

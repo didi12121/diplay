@@ -90,4 +90,12 @@ object ProjectionHost {
     val carPlayBackend: com.shilapi.xcertplay.projection.carplay.CarPlayProjectionBackend?
         get() = manager.backend(com.shilapi.xcertplay.projection.carplay.CarPlayProjectionBackend.ID)
             as? com.shilapi.xcertplay.projection.carplay.CarPlayProjectionBackend
+
+    /**
+     * The registered CarLife backend, if any. The backend itself lives in the
+     * `carlife-provider` module (open CarLife V2 SDK, Apache-2.0); it is
+     * registered by the app layer so `shared` stays protocol-agnostic.
+     */
+    fun carLifeBackend(): com.shilapi.xcertplay.projection.ProjectionBackend? =
+        manager.backend("carlife")
 }
