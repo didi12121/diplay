@@ -69,6 +69,29 @@ class CarLinkController(
     var sessionActive: Boolean = false
         private set
 
+    /**
+     * Session epoch bookkeeping: every connect attempt gets a fresh epoch and
+     * callbacks are interpreted against the epoch of the session they belong
+     * to. A real adapter backed by an SDK with session identity (sessionId,
+     * handle, connectionId) should prefer that identity; this counter is the
+     * controller-level fallback.
+     */
+    private var nextSessionEpoch = 0L
+
+    @Volatile
+    private var currentSessionEpoch = 0L
+
+    /**
+     * Trailing-end guard: sessions torn down non-normally (FATAL error, adapter
+     * failure mid-connect/disconnect, media-acquire failure) may still deliver
+     * their `onSessionEnded` afterwards. Such an end belongs to a DEAD session
+     * and must never overwrite a newer session's state (e.g. publish Ready over
+     * Connecting/Connected) or tear down a newer live session. Counted because
+     * more than one dead session can owe an end.
+     */
+    @Volatile
+    private var staleEndsExpected = 0
+
     init {
         adapter.setListener(Listener())
     }
@@ -131,11 +154,21 @@ class CarLinkController(
     /**
      * The device [connect] would actually talk to. [ProjectionManager] calls
      * this BEFORE resource arbitration, so the claimed resources always match
-     * the device really connected (same list order as [connect]'s fallback).
+     * the device really connected.
+     *
+     * - `requested == null` → the first discovered device (same choice
+     *   [connect] makes for a null request);
+     * - `requested != null` → the requested device **only if it is still
+     *   discovered**, otherwise null. A device that vanished between request
+     *   and connect must never silently fall back to another phone.
      */
     fun resolveConnectDevice(requested: ProjectionDevice?): ProjectionDevice? {
-        if (requested != null) return requested
-        return discovered.firstOrNull()?.toProjectionDevice(backendId)
+        if (requested == null) {
+            return discovered.firstOrNull()?.toProjectionDevice(backendId)
+        }
+        return discovered
+            .firstOrNull { it.deviceId == requested.id }
+            ?.toProjectionDevice(backendId)
     }
 
     fun connect(device: ProjectionDevice?): CarLinkOperationResult {
@@ -150,14 +183,20 @@ class CarLinkController(
             )
             return CarLinkOperationResult.Failure("PROVIDER_UNAVAILABLE", message)
         }
-        // Same resolution as resolveConnectDevice: never pick a different
-        // device than the manager arbitrated resources for.
-        val resolved = resolveConnectDevice(device)
-        val target = resolved?.let { projection ->
-            discovered.firstOrNull { it.deviceId == projection.id }
-        } ?: discovered.firstOrNull()
+        // Explicit request: connect THAT device or fail. Never fall back to a
+        // different phone (that would connect USB while WIFI was arbitrated).
+        // Null request: the first discovered device, same as resolveConnectDevice.
+        val target = if (device != null) {
+            discovered.firstOrNull { it.deviceId == device.id }
+        } else {
+            discovered.firstOrNull()
+        }
         if (target == null) {
-            val message = "no CarLink device discovered yet"
+            val message = if (device != null) {
+                "CarLink device ${device.id} is no longer available"
+            } else {
+                "no CarLink device discovered yet"
+            }
             emit(
                 CarLinkSessionEvent.Error(
                     "CONNECT_FAILED",
@@ -168,10 +207,16 @@ class CarLinkController(
             return CarLinkOperationResult.Failure("CONNECT_FAILED", message)
         }
         diagnostics.event("connecting", "device=${target.deviceId}")
+        currentSessionEpoch = synchronized(this) { ++nextSessionEpoch }
         return guarded("connect") { adapter.connect(target) }
     }
 
-    fun disconnect(): CarLinkOperationResult = guarded("disconnect") { adapter.disconnect() }
+    fun disconnect(): CarLinkOperationResult {
+        // An explicit disconnect ends the CURRENT session: the upcoming
+        // onSessionEnded belongs to it, not to some earlier dead session.
+        staleEndsExpected = 0
+        return guarded("disconnect") { adapter.disconnect() }
+    }
 
     fun dispose() {
         try {
@@ -196,7 +241,11 @@ class CarLinkController(
                 "adapter-failed",
                 "op=$operation error=${error.javaClass.simpleName}",
             )
-            teardownSession(operation)
+            // A session in flight (connect/disconnect) or an active one may owe
+            // a trailing onSessionEnded after this teardown.
+            val trailingPossible = sessionActive ||
+                operation == "connect" || operation == "disconnect"
+            teardownSession(operation, trailingEndPossible = trailingPossible)
             val message = "CarLink adapter $operation failed: ${error.javaClass.simpleName}"
             emit(
                 CarLinkSessionEvent.Error(
@@ -209,8 +258,15 @@ class CarLinkController(
         }
     }
 
-    /** Clears session and channel state after a session ends or fails. */
-    private fun teardownSession(reason: String) {
+    /**
+     * Clears session and channel state after a session ends or fails.
+     *
+     * [trailingEndPossible] arms the trailing-end guard: the torn-down SDK
+     * session may still deliver its `onSessionEnded`, and that callback must
+     * later be recognized as belonging to this DEAD session (ignored with a
+     * diagnostic) instead of overwriting or tearing down a newer one.
+     */
+    private fun teardownSession(reason: String, trailingEndPossible: Boolean = false) {
         val wasActive = sessionActive
         sessionActive = false
         currentDevice = null
@@ -227,8 +283,12 @@ class CarLinkController(
                 diagnostics.event("media-close-failed", "error=${error.javaClass.simpleName}")
             }
         }
+        if (trailingEndPossible) staleEndsExpected++
         if (wasActive) {
-            diagnostics.event("session-torn-down", "reason=${CarLinkDiagnostics.redact(reason)}")
+            diagnostics.event(
+                "session-torn-down",
+                "reason=${CarLinkDiagnostics.redact(reason)} epoch=$currentSessionEpoch",
+            )
         }
     }
 
@@ -257,7 +317,7 @@ class CarLinkController(
                 mediaSinks.acquire()
             } catch (error: Exception) {
                 diagnostics.event("media-acquire-failed", "error=${error.javaClass.simpleName}")
-                teardownSession("media-acquire-failed")
+                teardownSession("media-acquire-failed", trailingEndPossible = true)
                 emit(
                     CarLinkSessionEvent.Error(
                         "ADAPTER_FAILURE",
@@ -275,6 +335,20 @@ class CarLinkController(
         }
 
         override fun onSessionEnded(reason: String) {
+            // Trailing-end guard: sessions torn down non-normally (FATAL error,
+            // adapter failure) may deliver their onSessionEnded afterwards.
+            // Such an end belongs to a DEAD session — consume it with a clear
+            // diagnostic and do NOT publish state changes (a late Ready would
+            // overwrite the latched Error or a newer Connecting/Connected) and
+            // do NOT tear down a newer live session or its media.
+            if (staleEndsExpected > 0) {
+                staleEndsExpected--
+                diagnostics.event(
+                    "stale-session-end-ignored",
+                    "reason=${CarLinkDiagnostics.redact(reason)} epoch=$currentSessionEpoch",
+                )
+                return
+            }
             teardownSession(reason)
             diagnostics.event("disconnected", "reason=${CarLinkDiagnostics.redact(reason)}")
             emit(CarLinkSessionEvent.Disconnected(CarLinkDiagnostics.redact(reason)))
@@ -320,7 +394,8 @@ class CarLinkController(
                 }
                 CarLinkErrorSeverity.FATAL -> {
                     diagnostics.event("error-fatal", "code=$code message=$redacted")
-                    teardownSession("fatal:$code")
+                    // The dead SDK session usually still reports its end later.
+                    teardownSession("fatal:$code", trailingEndPossible = true)
                     emit(CarLinkSessionEvent.Error(code, redacted, cause, CarLinkErrorSeverity.FATAL))
                 }
             }

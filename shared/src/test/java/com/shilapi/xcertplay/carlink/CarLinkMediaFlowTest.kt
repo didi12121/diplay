@@ -295,11 +295,16 @@ class CarLinkMediaFlowTest {
     }
 
     @Test
-    fun unknownTransportRequestsAudioOnly() {
+    fun unknownTransportClaimsNothing() {
         val (backend, _, _) = backendOf(MockCarLinkProtocolAdapter())
+        // No resolved device → transport unknown → zero speculative claims.
         assertEquals(
-            setOf(ProjectionResource.AUDIO),
+            emptySet<ProjectionResource>(),
             backend.requiredResourcesFor(null),
+        )
+        assertEquals(
+            emptySet<ProjectionResource>(),
+            CarLinkCapabilities.resourcesFor(ProjectionTransport.UNKNOWN),
         )
     }
 

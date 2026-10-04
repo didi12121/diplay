@@ -55,13 +55,16 @@ object CarLinkCapabilities {
      *
      *  - USB CarLink      → USB + AUDIO
      *  - Wireless CarLink → WIFI + AUDIO
-     *  - unknown          → AUDIO only (link-level resource claimed on connect)
+     *  - unknown          → nothing. Without a resolved device the transport is
+     *    unknown and no session hardware may be claimed speculatively — the
+     *    connect fails cleanly instead of holding AUDIO (or USB/WIFI) hostage.
      *
      * Reserved capabilities ([BLUETOOTH_DISCOVERY_RESERVED],
      * [MICROPHONE_UPLINK_RESERVED]) add BLUETOOTH / MICROPHONE when the real
      * protocol is known to need them.
      */
     fun resourcesFor(transport: ProjectionTransport): Set<ProjectionResource> {
+        if (transport == ProjectionTransport.UNKNOWN) return emptySet()
         val resources = mutableSetOf(ProjectionResource.AUDIO)
         when (transport) {
             ProjectionTransport.USB -> resources.add(ProjectionResource.USB)

@@ -388,6 +388,10 @@ class ProjectionManager(
         // 0. Resolve the actual connect target FIRST: the device resources are
         //    claimed for must be the very device the backend connects — never
         //    "manager assumed UNKNOWN, backend picked a USB phone".
+        //
+        //    resolveConnectDevice() validates that an explicitly requested
+        //    device still exists; a vanished one resolves to null and must fail
+        //    cleanly instead of falling back to another phone.
         val resolved = target.resolveConnectDevice(device)
         // 1. A live session in any other backend is an absolute conflict: the
         //    caller must use takeover() for a controlled switch.
@@ -406,11 +410,11 @@ class ProjectionManager(
         // 2. Confirmed-stopped backends must not keep hardware hostage.
         cleanupStoppedClaimsExcept(target.id)
         // 3. Claim the resources this session needs. The claim is computed for
-        //    the RESOLVED device (same one step 4 connects), so transport-based
-        //    claims (USB vs Wi-Fi CarLink) can never drift from reality. With
-        //    no resolved target the backend's "unknown device" set applies —
-        //    never a speculative USB/WIFI claim.
-        val resources = target.requiredResourcesFor(resolved ?: device)
+        //    the RESOLVED device only (same one step 4 connects), so transport
+        //    claims can never drift from reality. With no resolved target the
+        //    backend's "no known device" set applies — for CarLink that is
+        //    empty: nothing is claimed speculatively and the connect fails.
+        val resources = target.requiredResourcesFor(resolved)
         if (resources.isNotEmpty()) {
             try {
                 coordinator.acquire(target.id, resources)
@@ -426,7 +430,10 @@ class ProjectionManager(
         notifySelection(target.id)
         logger.log("manager connect backend=${target.id} device=${resolved?.id ?: "unresolved"}")
         // 4. Connect the SAME resolved device the resources were claimed for.
-        target.connect(resolved)
+        //    When an explicit request could not be resolved (device vanished),
+        //    forward the request anyway: the backend looks it up strictly and
+        //    reports CONNECT_FAILED — it must never fall back to another phone.
+        target.connect(resolved ?: device)
     }
 
     /** Releases claims left behind by backends whose sessions are confirmed gone. */

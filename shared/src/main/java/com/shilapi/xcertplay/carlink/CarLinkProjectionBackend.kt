@@ -105,9 +105,10 @@ class CarLinkProjectionBackend(
 
     override fun requiredResourcesFor(device: ProjectionDevice?): Set<ProjectionResource> =
         CarLinkCapabilities.resourcesFor(
-            // A resolved device always wins; without one, fall back to the
-            // negotiated transport of the live/current session.
-            device?.transport ?: currentTransport,
+            // Only a real (resolved) device tells us the transport. Without one
+            // the transport is UNKNOWN and nothing may be claimed speculatively
+            // — a connect without a discoverable device fails cleanly instead.
+            device?.transport ?: ProjectionTransport.UNKNOWN,
         )
 
     /**

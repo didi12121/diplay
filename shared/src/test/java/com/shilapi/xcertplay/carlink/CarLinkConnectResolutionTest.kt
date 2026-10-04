@@ -161,13 +161,17 @@ class CarLinkConnectResolutionTest {
     }
 
     @Test
-    fun explicitRequestIsReturnedAsIs() {
+    fun explicitRequestIsResolvedAgainstDiscovery() {
         val adapter = RecordingAdapter()
         val backend = backendOf(adapter)
         backend.initialize()
         backend.start()
+        // An explicit request is validated against the discovery list and
+        // resolved to the DISCOVERED device — the authoritative transport wins.
         val requested = ProjectionDevice("dev-oppo", "OPPO", CarLinkProjectionBackend.ID)
-        assertSameDevice(requested, backend.resolveConnectDevice(requested))
+        val resolved = backend.resolveConnectDevice(requested)
+        assertEquals("dev-oppo", resolved?.id)
+        assertEquals(ProjectionTransport.WIFI, resolved?.transport)
     }
 
     @Test

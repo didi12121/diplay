@@ -129,12 +129,9 @@ class CarLinkStateAndLifecycleTest {
         manager.register(backend)
         backend.initialize()
         backend.start()
-        val usbPhone = com.shilapi.xcertplay.projection.ProjectionDevice(
-            id = "d1",
-            name = "phone",
-            backendId = CarLinkProjectionBackend.ID,
-            transport = com.shilapi.xcertplay.projection.ProjectionTransport.USB,
-        )
+        // Use a REAL discovered device: explicit requests are validated against
+        // the discovery list and a stale one fails instead of falling back.
+        val usbPhone = backend.discoveredDevices().first { it.transport == com.shilapi.xcertplay.projection.ProjectionTransport.USB }
         manager.connect(usbPhone)
         // Transport-aware claims: a USB session owns USB + AUDIO.
         assertEquals(
