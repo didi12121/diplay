@@ -75,9 +75,10 @@ fallback for streams without timestamps (CarPlay).
 |---|---|
 | `select()` | preference only — never stops or releases anything |
 | `connect()` | resolves the actual target device FIRST (`resolveConnectDevice`), claims resources for THAT device, connects THAT device — no drift |
+| explicit device vanished before connect | `CONNECT_FAILED` — never falls back to another phone; zero claims |
 | USB CarLink | claims `USB + AUDIO` |
 | Wireless CarLink | claims `WIFI + AUDIO` |
-| nothing discovered + `connect(null)` | no speculative claims; clear connect failure |
+| nothing discovered + `connect(null)` | zero resource claims (UNKNOWN transport claims nothing); clear connect failure |
 | live foreign session | `RESOURCE_CONFLICT` — `takeover()` is the only controlled switch |
 | `takeover()` | Activated → start now; AwaitingStop → wait for `onTakeoverActivated` (no polling); Blocked → never start |
 | second takeover while one is pending | `Blocked(TAKEOVER_IN_PROGRESS)` — the pending takeover and its listener are never replaced |
@@ -93,6 +94,12 @@ fallback for streams without timestamps (CarPlay).
 - A **FATAL** error latches `Error`: a trailing `onSessionEnded` of the same
   failing session only completes cleanup/release and must not reset the state
   to Ready. The next `initialize`/`start`/`connect` clears the latch.
+- **Stale session ends are isolated** (trailing-end guard / session epoch):
+  sessions torn down non-normally may still deliver their `onSessionEnded`
+  afterwards. Such a callback is consumed with a `stale-session-end-ignored`
+  diagnostic and can never overwrite a newer attempt's state (Ready over
+  Connecting), tear down a newer live session, release its lease or close its
+  media sinks. An explicit `disconnect()` of the current session always works.
 
 ## What `OfficialCarLinkSdkAdapter` must implement
 

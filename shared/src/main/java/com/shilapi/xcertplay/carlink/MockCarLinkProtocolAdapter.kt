@@ -211,6 +211,13 @@ class MockCarLinkProtocolAdapter(
     }
 
     /** Test hook: pushes a fake session end through the listener. */
+    /** Test hook: reports a session start as if the SDK had connected. */
+    fun simulateSessionStarted(device: CarLinkDevice) {
+        connected = device
+        connectCount += 1
+        listener?.onSessionStarted(device)
+    }
+
     fun simulateSessionEnd(reason: String) {
         val device = connected ?: return
         connected = null
