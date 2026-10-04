@@ -662,8 +662,11 @@ class DiPlayActivity : ComponentActivity() {
             // tone so a developer can verify Surface/MediaCodec/AudioTrack end
             // to end. Never present in a release APK.
             if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-                card.addView(button("Developer: mock session (test pattern + tone)", false) {
-                    startMockCarLinkSession(backend)
+                card.addView(button("Developer: mock USB session (test pattern + tone)", false) {
+                    startMockCarLinkSession(transport = com.shilapi.xcertplay.projection.ProjectionTransport.USB)
+                }, matchButton(10, 60))
+                card.addView(button("Developer: mock Wi-Fi session (test pattern + tone)", false) {
+                    startMockCarLinkSession(transport = com.shilapi.xcertplay.projection.ProjectionTransport.WIFI)
                 }, matchButton(10, 60))
             }
         }
@@ -681,13 +684,25 @@ class DiPlayActivity : ComponentActivity() {
         if (backendId == CarLinkProjectionBackend.ID && state == ProjectionState.Connected) {
             runOnUiThread {
                 if (!isFinishing && !isDestroyed) {
-                    startActivity(Intent(this, ProjectionSessionActivity::class.java))
+                    // Bind the page to the CarLink backend explicitly — the
+                    // page never follows a drifting "active backend".
+                    startActivity(
+                        ProjectionSessionActivity.createIntent(this, CarLinkProjectionBackend.ID),
+                    )
                 }
             }
         }
     }
 
-    private fun startMockCarLinkSession(current: CarLinkProjectionBackend) {
+    /**
+     * Debug-only harness: registers the mock protocol adapter with a device of
+     * the chosen [transport] and streams a real H.264 test pattern + PCM tone
+     * through the shared media pipeline. Verifies that USB mock claims
+     * USB+AUDIO and Wi-Fi mock claims WIFI+AUDIO.
+     */
+    private fun startMockCarLinkSession(
+        transport: com.shilapi.xcertplay.projection.ProjectionTransport,
+    ) {
         val adapter = com.shilapi.xcertplay.carlink.MockCarLinkProtocolAdapter()
         val backend = ProjectionHost.registerCarLinkMock(
             mediaSinks = com.shilapi.xcertplay.carlink.AndroidCarLinkMediaSinkProvider(
@@ -698,7 +713,10 @@ class DiPlayActivity : ComponentActivity() {
         )
         backend.initialize()
         backend.start()
-        val device = backend.discoveredDevices().firstOrNull()
+        // Pick the discovered phone matching the requested transport so the
+        // harness proves both resource paths (USB+AUDIO vs WIFI+AUDIO).
+        val device = backend.discoveredDevices().firstOrNull { it.transport == transport }
+            ?: backend.discoveredDevices().firstOrNull()
         ProjectionHost.manager.select(ProjectionMode.CARLINK)
         if (device != null) {
             try {
@@ -710,6 +728,8 @@ class DiPlayActivity : ComponentActivity() {
         }
         mockPattern?.close()
         mockPattern = com.shilapi.xcertplay.carlink.MockCarLinkTestPattern(adapter).also { it.start() }
+        val held = ProjectionHost.manager.resourcesHeldBy(CarLinkProjectionBackend.ID)
+        toast("Mock session up — held resources: ${held.joinToString(", ")}")
         refreshCarLinkPanel()
     }
 

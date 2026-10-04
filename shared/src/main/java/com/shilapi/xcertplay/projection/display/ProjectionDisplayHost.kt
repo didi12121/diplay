@@ -72,6 +72,13 @@ class ProjectionSurfaceHost : ProjectionDisplayHost {
     @Volatile
     private var current: ProjectionSurfaceHandle? = null
 
+    /**
+     * Identity of the UI object that pushed [current] (typically the Activity
+     * instance). Guards against stale callbacks after an Activity recreate.
+     */
+    @Volatile
+    private var currentOwner: Any? = null
+
     override val currentSurface: ProjectionSurfaceHandle?
         get() = current
 
@@ -86,22 +93,40 @@ class ProjectionSurfaceHost : ProjectionDisplayHost {
     }
 
     /** SurfaceHolder.Callback: surfaceCreated. */
-    fun surfaceAvailable(surface: Surface, width: Int, height: Int) {
+    fun surfaceAvailable(owner: Any, surface: Surface, width: Int, height: Int) {
         val handle = ProjectionSurfaceHandle(surface, width, height)
         current = handle
+        currentOwner = owner
         dispatch { it.onSurfaceAvailable(handle) }
     }
 
     /** SurfaceHolder.Callback: surfaceChanged. */
-    fun surfaceChanged(surface: Surface, width: Int, height: Int) {
+    fun surfaceChanged(owner: Any, surface: Surface, width: Int, height: Int) {
+        val existing = current
+        if (existing == null) {
+            surfaceAvailable(owner, surface, width, height)
+            return
+        }
+        // Only the owner of the current surface may update it; a late callback
+        // from an old Activity's Surface must not touch the new one.
+        if (owner !== currentOwner) return
         val handle = ProjectionSurfaceHandle(surface, width, height)
         current = handle
         dispatch { it.onSurfaceChanged(handle) }
     }
 
-    /** SurfaceHolder.Callback: surfaceDestroyed. */
-    fun surfaceDestroyed() {
+    /**
+     * SurfaceHolder.Callback: surfaceDestroyed.
+     *
+     * Owner-scoped: only the owner of the **current** surface may clear it. A
+     * late `surfaceDestroyed` from an old Activity's Surface (after an Activity
+     * recreate already installed a new surface) is ignored — it must never
+     * clear a newer surface.
+     */
+    fun surfaceDestroyed(owner: Any) {
+        if (current == null || owner !== currentOwner) return
         current = null
+        currentOwner = null
         dispatch { it.onSurfaceDestroyed() }
     }
 
