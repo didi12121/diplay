@@ -1,0 +1,13 @@
+package com.baidu.carlife.protobuf;
+import "CarlifeVehicleDataProto.proto";
+message CarlifeVehicleDataList
+{
+    // 是否支持
+	required bool support = 1;
+
+	// 校验数据
+	optional string token_string = 2;
+
+	// 车信息
+	repeated CarlifeVehicleData vehicleData = 3;
+}

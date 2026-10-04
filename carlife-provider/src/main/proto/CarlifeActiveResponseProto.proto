@@ -1,0 +1,6 @@
+package com.baidu.carlife.protobuf;
+message CarlifeActiveResponse
+{
+    required string statue = 1;
+    optional string token = 2;
+}

@@ -1,0 +1,40 @@
+package com.baidu.carlife.protobuf;
+message CarlifeVehicleControl
+{
+	// 指令类型
+    required int32 type = 1;
+
+    // 属性id
+    required int32 id = 2;
+
+    // 是否支持
+    optional bool support = 3;
+
+    // 校验数据
+    optional string token_string = 4;
+
+    // 区域ID，中控/车窗/车座等
+    optional int32 area_id = 5;
+
+    // 区域列表，前车窗/后车窗，主驾驶位座位/副驾驶座位等
+    repeated int32 area_value = 6;
+
+    // 属性值的类型
+    optional int32 value_type = 7;
+    // byte类型的属性值
+    optional bytes bytes_value = 8;
+
+    // int32类型的属性值
+    repeated sint32 int32_values = 9;
+
+    // int64类型的属性值
+    repeated sint64 int64_values = 10;
+
+    // float类型的属性值
+    repeated float float_values = 11;
+
+    // string类型的属性值
+    optional string string_value = 12;
+
+
+}

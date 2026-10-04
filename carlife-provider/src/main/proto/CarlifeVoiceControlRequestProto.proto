@@ -1,0 +1,6 @@
+package com.baidu.carlife.protobuf;
+message CarlifeVoiceControlRequest
+{
+    required int32 command = 1;
+    optional int32 opt = 2;
+}

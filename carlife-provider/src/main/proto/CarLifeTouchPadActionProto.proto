@@ -1,0 +1,29 @@
+package com.yftech;
+
+
+message CarlifeTouchPadDown
+{
+  required int32 timestamp = 1;
+}
+
+message CarlifeTouchPadMove
+{
+  required int32 timestamp = 1;
+  required int32 deltaX = 2;
+  required int32 deltaY = 3;
+}
+
+message CarlifeTouchPadUp
+{
+  required int32 timestamp = 1;
+}
+
+message CarlifeTouchPadFocus
+{
+  required int32 timestamp = 1;
+}
+
+message CarlifeTouchPadPinch
+{
+  required float scale = 1;
+}

@@ -1,0 +1,4 @@
+package com.baidu.carlife.protobuf;
+message CarlifeConnectTimeSync {
+  required int32 timeStamp = 1;
+}

@@ -1,0 +1,6 @@
+package com.baidu.carlife.protobuf;
+message CarlifeWirlessTarget
+{
+    required string wifiDeviceName = 1;
+    required string targetInfo = 2;
+}

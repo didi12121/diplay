@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+
+    <!-- Android P适配，当http请求时，可允许进行http请求 -->
+    <base-config cleartextTrafficPermitted = "true" />
+
+</network-security-config>

@@ -1,0 +1,5 @@
+package com.baidu.carlife.protobuf;
+message CarlifeMdAesKeyRequest
+{
+    required string aesKey = 1;
+}

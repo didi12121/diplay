@@ -1,0 +1,7 @@
+package com.baidu.carlife.protobuf;
+message CarlifeActiveRequest
+{
+    required string mac = 1;
+    required int32 isActive = 2;
+    required int32 randomValue  = 3;
+}
