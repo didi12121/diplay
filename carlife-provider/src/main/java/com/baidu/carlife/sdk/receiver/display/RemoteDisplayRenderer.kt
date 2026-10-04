@@ -93,16 +93,19 @@ class RemoteDisplayRenderer(private val context: CarLifeContext,
                     encoderInfo = message.protoPayload as CarlifeVideoEncoderInfo
                     listener.onVideoSizeChanged(encoderInfo!!.width, encoderInfo!!.height)
                     if (externalVideoSink) {
-                        // RAW_BRIDGE_MODE: no decoder here; still ask the phone
-                        // to start streaming - the external host video bridge
-                        // consumes MSG_VIDEO_DATA (and this message).
+                        // RAW_BRIDGE_MODE: no decoder here; ask the phone to
+                        // start streaming, then FORWARD this message (return
+                        // false) so the external host video bridge emits its
+                        // CarLifeVideoConfig - the chain must not starve later
+                        // transport listeners.
                         val start = obtain(MSG_CHANNEL_CMD, MSG_CMD_VIDEO_ENCODER_START)
                         context.postMessage(start)
-                        return true
+                        return false
                     }
                     if (surface != null) {
-                        var messgae = obtain(MSG_CHANNEL_CMD, MSG_CMD_VIDEO_ENCODER_START)
-                        context.postMessage(messgae)
+                        frameDecoder = FrameDecoder(context, surface!!, encoderInfo!!)
+                        val startMessage = obtain(MSG_CHANNEL_CMD, MSG_CMD_VIDEO_ENCODER_START)
+                        context.postMessage(startMessage)
                         Logger.d(Constants.TAG, "RemoteDisplayRenderer postMessage MSG_CMD_VIDEO_ENCODER_START 1")
                         return true
                     }

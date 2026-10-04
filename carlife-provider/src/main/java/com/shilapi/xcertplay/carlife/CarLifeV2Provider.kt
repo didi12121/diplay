@@ -223,6 +223,11 @@ class CarLifeV2Provider(
             )
             val configs = mapOf(
                 Configs.CONFIG_PROTOCOL_VERSION to config.protocolVersion,
+                // RAW_BRIDGE_MODE: MUST be present BEFORE CarLife.init because
+                // RemoteDisplayRenderer reads it in its constructor. The host
+                // video bridge owns decoding; the upstream FrameDecoder is
+                // bypassed. Host-local only - never phone-visible.
+                Configs.CONFIG_EXTERNAL_VIDEO_SINK to true,
             )
             CarLife.init(
                 appContext,

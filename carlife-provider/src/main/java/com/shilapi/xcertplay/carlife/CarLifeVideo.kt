@@ -44,11 +44,20 @@ class CarLifeVideoFrame(
     val keyFrame: Boolean,
 )
 
+/** Video handshake counters (protocol-level only; no payloads). */
+data class CarLifeVideoHandshake(
+    val initSent: Boolean = false,
+    val initDoneReceived: Boolean = false,
+    val startSent: Boolean = false,
+    val dataSeen: Boolean = false,
+)
+
 /** Session-scoped video callbacks; every event carries its session token. */
 interface CarLifeVideoListener {
     fun onVideoConfig(session: CarLifeSessionToken, config: CarLifeVideoConfig)
     fun onVideoFrame(session: CarLifeSessionToken, frame: CarLifeVideoFrame)
     fun onVideoStopped(session: CarLifeSessionToken)
+    fun onVideoHandshake(session: CarLifeSessionToken, handshake: CarLifeVideoHandshake) {}
 }
 
 /**
@@ -124,9 +133,28 @@ class CarLifeVideoBridge(
     private var width = 0
     private var height = 0
 
+    private var handshake = CarLifeVideoHandshake()
+
+    private fun markHandshake(update: CarLifeVideoHandshake) {
+        handshake = update
+        listener.onVideoHandshake(session, update)
+    }
+
+    /** Observes the vehicle→phone handshake sends (INIT / START). */
+    override fun onSendMessage(context: CarLifeContext, message: CarLifeMessage): Boolean {
+        when (message.serviceType) {
+            ServiceTypes.MSG_CMD_VIDEO_ENCODER_INIT ->
+                if (!handshake.initSent) markHandshake(handshake.copy(initSent = true))
+            ServiceTypes.MSG_CMD_VIDEO_ENCODER_START ->
+                if (!handshake.startSent) markHandshake(handshake.copy(startSent = true))
+        }
+        return false // never starve other send listeners
+    }
+
     override fun onReceiveMessage(context: CarLifeContext, message: CarLifeMessage): Boolean {
         when (message.serviceType) {
             ServiceTypes.MSG_CMD_VIDEO_ENCODER_INIT_DONE -> {
+                if (!handshake.initDoneReceived) markHandshake(handshake.copy(initDoneReceived = true))
                 val info = message.protoPayload as? CarlifeVideoEncoderInfoProto.CarlifeVideoEncoderInfo
                     ?: return true
                 width = info.width
@@ -142,6 +170,7 @@ class CarLifeVideoBridge(
                 return true
             }
             ServiceTypes.MSG_VIDEO_DATA -> {
+                if (!handshake.dataSeen) markHandshake(handshake.copy(dataSeen = true))
                 if (message.payloadSize <= 0) return true
                 // Copy the payload window out of the pooled message NOW.
                 val payload = CarLifeVideoFraming.copyWindow(message.body, message.commandSize, message.payloadSize)
@@ -208,6 +237,8 @@ class CarLifeProjectionVideoAdapter(
     override fun onVideoConfig(session: CarLifeSessionToken, config: CarLifeVideoConfig) {
         width = config.width
         height = config.height
+        // Lifecycle semantics: a real stream is now active.
+        sink.onVideoStreamActive(true)
         sink.onVideoConfig(
             com.shilapi.xcertplay.projection.ProjectionVideoConfig(
                 codec = com.shilapi.xcertplay.projection.ProjectionVideoCodec.H264,

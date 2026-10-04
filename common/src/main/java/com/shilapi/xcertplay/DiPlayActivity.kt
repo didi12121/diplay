@@ -696,6 +696,7 @@ class DiPlayActivity : ComponentActivity() {
             appendLine("held resources: ${if (held.isEmpty()) "-" else held.joinToString(", ")}")
             appendLine("video: ${report.videoCodec ?: "-"} ${report.videoWidth ?: "-"}x${report.videoHeight ?: "-"}  stage: ${report.videoStage}")
             appendLine("video stats: cfg=${report.videoConfigCount} frames=${report.videoFrameCount} bytes=${report.videoBytes} keyframes=${report.keyframeCount}")
+            appendLine("video handshake: initSent=${report.videoInitSent} initDone=${report.videoInitDoneReceived} startSent=${report.videoStartSent} dataSeen=${report.videoDataSeen}")
             appendLine("pts: ${report.ptsSource}  decoder: ${report.decoderState}  firstFrame: ${report.firstFrameRendered}")
             appendLine("video error: ${report.lastVideoError ?: "-"}  phone CarLife protocol: ${report.phoneCarlifeProtocolVersion ?: "0 (not reported)"}")
             append("DEMO_CHANNEL — NOT FOR PRODUCTION — COMPATIBILITY UNVERIFIED")

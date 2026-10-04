@@ -119,6 +119,11 @@ data class CarLifeProbeReport(
     val decoderState: String = "idle",
     val firstFrameRendered: Boolean = false,
     val lastVideoError: String? = null,
+    // ---- Video handshake (protocol-level flags for real-device triage) ----
+    val videoInitSent: Boolean = false,
+    val videoInitDoneReceived: Boolean = false,
+    val videoStartSent: Boolean = false,
+    val videoDataSeen: Boolean = false,
 )
 
 /**

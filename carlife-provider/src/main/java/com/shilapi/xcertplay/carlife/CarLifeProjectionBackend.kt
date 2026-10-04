@@ -234,9 +234,15 @@ class CarLifeProjectionBackend(
                     connectionState = 1,
                 )
                 armProbeTimeout(current)
+                // Open the session video pipeline EARLY (idempotent): the
+                // phone may answer VIDEO_ENCODER_INIT_DONE right after
+                // Established, before any later callback could register the
+                // bridge. Racing it would drop the first config.
+                ensureVideoSink(current)
                 stateStore.publish(ProjectionState.Connecting)
             }
             is CarLifeConnectionEvent.Reattached -> {
+                ensureVideoSink(current)
                 probeReport = probeReport.copy(state = CarLifeProbeState.AOA_ATTACHED, aoaState = "reattached")
                 stateStore.publish(ProjectionState.Connecting)
             }
@@ -260,8 +266,9 @@ class CarLifeProjectionBackend(
                     authResult = "accepted",
                     phoneCarlifeProtocolVersion = provider.diagnostics().phoneCarlifeProtocolVersion,
                 )
-                // REAL VIDEO: bind the session-scoped video pipeline.
-                openVideoSink(current)
+                // REAL VIDEO: ensure the session-scoped video pipeline exists
+                // (opened at Attached already; idempotent per token).
+                ensureVideoSink(current)
                 stateStore.publish(ProjectionState.Connected)
             }
             is CarLifeConnectionEvent.VersionNotSupported -> {
@@ -378,10 +385,28 @@ class CarLifeProjectionBackend(
             probeReport = probeReport.copy(decoderState = "stopped")
             adapter.onVideoStopped(session)
         }
+
+        override fun onVideoHandshake(session: CarLifeSessionToken, handshake: CarLifeVideoHandshake) {
+            if (session != activeSession) return
+            probeReport = probeReport.copy(
+                videoInitSent = handshake.initSent,
+                videoInitDoneReceived = handshake.initDoneReceived,
+                videoStartSent = handshake.startSent,
+                videoDataSeen = handshake.dataSeen,
+            )
+        }
     }
 
-    private fun openVideoSink(token: CarLifeSessionToken) {
+    /**
+     * Idempotent per [token]: opens THIS session's video pipeline at most
+     * once. Called at AOA attach (before version/auth) and re-checked at
+     * Established — never creates a second sink for the same session.
+     */
+    private fun ensureVideoSink(token: CarLifeSessionToken) {
         val sinkProvider = videoSinkProvider ?: return
+        synchronized(videoLock) {
+            if (videoSinkToken == token) return // already open for this session
+        }
         try {
             val sessionSink = sinkProvider.acquire(::onDecoderDiagnostic)
             val adapter = CarLifeProjectionVideoAdapter(sessionSink.video)
