@@ -42,7 +42,7 @@ class CarLinkStaleDeviceTest {
         }
 
         override fun stopDiscovery() {}
-        override fun connect(device: CarLinkDevice) {
+        override fun connect(device: CarLinkDevice, session: CarLinkSessionToken) {
             connected.add(device.deviceId)
         }
 

@@ -34,6 +34,21 @@ data class CarLinkDevice(
 }
 
 /**
+ * Opaque session identity minted by [CarLinkController] — one per connect
+ * attempt. Every session-scoped callback carries it, so a late callback from
+ * an old session is recognized by IDENTITY COMPARISON (never by arrival
+ * counting or timing) and can be ignored deterministically.
+ *
+ * A real adapter binds this token to its SDK session identity (sessionHandle,
+ * connectionId, …) on connect and echoes the token on every callback. If an
+ * SDK has no session identity of its own, the adapter must fully stop the
+ * previous session's callback workers before binding the next token.
+ */
+data class CarLinkSessionToken(val value: Long) {
+    override fun toString(): String = "session#$value"
+}
+
+/**
  * Format of one CarLink audio stream, announced by
  * [CarLinkProtocolListener.onAudioStarted] before its first frame.
  *
@@ -93,35 +108,39 @@ class CarLinkAudioFrame(
  * at this boundary.
  */
 interface CarLinkProtocolListener {
-    /** A phone was found during discovery. */
+    /** A phone was found during discovery (provider-scoped, no session). */
     fun onDeviceFound(device: CarLinkDevice) {}
 
-    /** The session reached the phone and media may start flowing. */
-    fun onSessionStarted(device: CarLinkDevice) {}
+    /** The session [session] reached the phone and media may start flowing. */
+    fun onSessionStarted(session: CarLinkSessionToken, device: CarLinkDevice) {}
 
-    /** The session ended (peer detach, timeout, explicit disconnect). */
-    fun onSessionEnded(reason: String) {}
+    /** Session [session] ended (peer detach, timeout, explicit disconnect). */
+    fun onSessionEnded(session: CarLinkSessionToken, reason: String) {}
 
     /** Out-of-band video configuration record (codec + decoder config). */
-    fun onVideoConfig(config: ProjectionVideoConfig) {}
+    fun onVideoConfig(session: CarLinkSessionToken, config: ProjectionVideoConfig) {}
 
     /** Encoded video access unit; payload is only valid during the call. */
-    fun onVideoFrame(frame: ProjectionVideoFrame) {}
+    fun onVideoFrame(session: CarLinkSessionToken, frame: ProjectionVideoFrame) {}
 
     /** One audio stream opened; frames of [CarLinkAudioFormat.streamId] follow. */
-    fun onAudioStarted(format: CarLinkAudioFormat) {}
+    fun onAudioStarted(session: CarLinkSessionToken, format: CarLinkAudioFormat) {}
 
     /** One audio access unit of an open stream. */
-    fun onAudioFrame(frame: CarLinkAudioFrame) {}
+    fun onAudioFrame(session: CarLinkSessionToken, frame: CarLinkAudioFrame) {}
 
-    /** The audio stream [streamId] ended; no further frames will arrive. */
-    fun onAudioStopped(streamId: Int) {}
+    /** The audio stream [streamId] of session [session] ended. */
+    fun onAudioStopped(session: CarLinkSessionToken, streamId: Int) {}
 
-    /** Now-playing / navigation metadata update. */
-    fun onMetadata(metadata: ProjectionMetadata) {}
+    /** Now-playing / navigation metadata update of session [session]. */
+    fun onMetadata(session: CarLinkSessionToken, metadata: ProjectionMetadata) {}
 
     /**
      * The protocol stack reported a failure.
+     *
+     * [session] scopes the error: `null` is a provider/discovery/global error
+     * (no session exists); non-null is a failure of that specific session. A
+     * provider error must never be given a fabricated token.
      *
      * [CarLinkErrorSeverity.RECOVERABLE] is logged as a diagnostic and the
      * session keeps running; [CarLinkErrorSeverity.FATAL] tears the session
@@ -130,6 +149,7 @@ interface CarLinkProtocolListener {
      * error with a healthy state. When in doubt, report FATAL.
      */
     fun onError(
+        session: CarLinkSessionToken?,
         code: String,
         message: String,
         severity: CarLinkErrorSeverity,
@@ -178,8 +198,14 @@ interface CarLinkProtocolAdapter {
 
     fun stopDiscovery()
 
-    /** Opens a session with [device]; progress arrives via the listener. */
-    fun connect(device: CarLinkDevice)
+    /**
+     * Opens a session with [device] under the controller-minted [session]
+     * token; progress arrives via the listener **echoing that token**. The
+     * adapter must not mint its own token — it binds [session] to the real SDK
+     * session identity (sessionHandle/connectionId) and translates callbacks
+     * back to [session].
+     */
+    fun connect(device: CarLinkDevice, session: CarLinkSessionToken)
 
     fun disconnect()
 

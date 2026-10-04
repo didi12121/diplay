@@ -21,6 +21,11 @@ import com.shilapi.xcertplay.projection.ProjectionVideoFrame
  * lifecycle, teardown) so the whole projection pipeline above the adapter can be
  * exercised and so an eventual official SDK adapter drops in behind the same
  * interface.
+ *
+ * Session identity: like a real adapter, it binds the controller-minted
+ * [CarLinkSessionToken] to its "SDK session" and echoes that token on every
+ * callback. The `simulate*` hooks take an explicit token so tests can drive
+ * out-of-order A/B callback interleavings deterministically.
  */
 class MockCarLinkProtocolAdapter(
     /** Devices discovery reports, in order. */
@@ -40,6 +45,11 @@ class MockCarLinkProtocolAdapter(
     private var discovering = false
     private var connected: CarLinkDevice? = null
 
+    /** The token of the current "SDK session" — what a real SDK handle maps to. */
+    @Volatile
+    var currentToken: CarLinkSessionToken? = null
+        private set
+
     /** Records every touch event for assertions. */
     val touchLog = java.util.Collections.synchronizedList(mutableListOf<ProjectionTouchEvent>())
 
@@ -49,6 +59,9 @@ class MockCarLinkProtocolAdapter(
     /** Increments on every successful connect; lets tests observe reconnects. */
     var connectCount: Int = 0
         private set
+
+    /** Tokens received via connect(), in order. */
+    val connectTokens = java.util.Collections.synchronizedList(mutableListOf<CarLinkSessionToken>())
 
     override fun initialize() {
         initialized = true
@@ -73,9 +86,10 @@ class MockCarLinkProtocolAdapter(
         discovering = false
     }
 
-    override fun connect(device: CarLinkDevice) {
+    override fun connect(device: CarLinkDevice, session: CarLinkSessionToken) {
         if (!initialized) {
             listener?.onError(
+                null,
                 "PROVIDER_UNAVAILABLE",
                 "mock adapter not initialized",
                 CarLinkErrorSeverity.FATAL,
@@ -83,13 +97,16 @@ class MockCarLinkProtocolAdapter(
             return
         }
         stopDiscovery()
+        connectTokens.add(session)
         if (autoConnect) {
             connected = device
+            currentToken = session
             connectCount += 1
-            listener?.onSessionStarted(device)
-            if (streamFakeMedia) streamFakeSessionMedia()
+            listener?.onSessionStarted(session, device)
+            if (streamFakeMedia) streamFakeSessionMedia(session)
             // Stream a single fake state packet so the pipeline sees live data.
             listener?.onMetadata(
+                session,
                 ProjectionMetadata(
                     title = "Mock track",
                     artist = "Mock artist",
@@ -102,9 +119,11 @@ class MockCarLinkProtocolAdapter(
 
     override fun disconnect() {
         val device = connected ?: return
+        val token = currentToken ?: return
         connected = null
-        listener?.onAudioStopped(FAKE_AUDIO_STREAM_ID)
-        listener?.onSessionEnded("mock disconnect device=${device.deviceId}")
+        currentToken = null
+        listener?.onAudioStopped(token, FAKE_AUDIO_STREAM_ID)
+        listener?.onSessionEnded(token, "mock disconnect device=${device.deviceId}")
     }
 
     override fun sendTouch(event: ProjectionTouchEvent) {
@@ -120,8 +139,9 @@ class MockCarLinkProtocolAdapter(
     }
 
     /** Streams one typed video config/frame and one audio start/frame/stop cycle. */
-    private fun streamFakeSessionMedia() {
+    private fun streamFakeSessionMedia(session: CarLinkSessionToken) {
         listener?.onVideoConfig(
+            session,
             ProjectionVideoConfig(
                 codec = ProjectionVideoCodec.H264,
                 codecData = FAKE_CODEC_DATA,
@@ -130,6 +150,7 @@ class MockCarLinkProtocolAdapter(
             ),
         )
         listener?.onVideoFrame(
+            session,
             ProjectionVideoFrame(
                 codec = ProjectionVideoCodec.H264,
                 width = FAKE_WIDTH,
@@ -140,6 +161,7 @@ class MockCarLinkProtocolAdapter(
             ),
         )
         listener?.onAudioStarted(
+            session,
             CarLinkAudioFormat(
                 streamId = FAKE_AUDIO_STREAM_ID,
                 role = ProjectionAudioChannel.MEDIA,
@@ -149,6 +171,7 @@ class MockCarLinkProtocolAdapter(
             ),
         )
         listener?.onAudioFrame(
+            session,
             CarLinkAudioFrame(
                 streamId = FAKE_AUDIO_STREAM_ID,
                 presentationTimeUs = FAKE_PTS_US,
@@ -157,14 +180,20 @@ class MockCarLinkProtocolAdapter(
         )
     }
 
-    /** Test hook: pushes a fake error through the listener. */
+    // ---- Test hooks: every one takes an explicit session token ----
+
+    /**
+     * Pushes an error. [session] null = provider-scoped; non-null = that
+     * session's error (tests use old tokens to simulate late failures).
+     */
     fun simulateError(
         code: String,
         message: String,
         severity: CarLinkErrorSeverity = CarLinkErrorSeverity.FATAL,
         cause: Throwable? = null,
+        session: CarLinkSessionToken? = currentToken,
     ) {
-        listener?.onError(code, message, severity, cause)
+        listener?.onError(session, code, message, severity, cause)
     }
 
     /** Test hook: pushes a fake adapter exception surface (protocol layer). */
@@ -177,51 +206,88 @@ class MockCarLinkProtocolAdapter(
         streamId: Int,
         role: ProjectionAudioChannel = ProjectionAudioChannel.NAVIGATION,
         payload: ByteArray = FAKE_AUDIO_PAYLOAD,
+        session: CarLinkSessionToken = currentToken!!,
     ) {
         listener?.onAudioStarted(
+            session,
             CarLinkAudioFormat(streamId, role, ProjectionAudioCodec.OPUS, 48_000, 2),
         )
-        listener?.onAudioFrame(CarLinkAudioFrame(streamId, FAKE_PTS_US, payload))
-        listener?.onAudioStopped(streamId)
+        listener?.onAudioFrame(session, CarLinkAudioFrame(streamId, FAKE_PTS_US, payload))
+        listener?.onAudioStopped(session, streamId)
     }
 
     /** Test hook: pushes a typed video config (developer harnesses). */
-    fun simulateVideoConfig(config: ProjectionVideoConfig) {
-        listener?.onVideoConfig(config)
+    fun simulateVideoConfig(
+        config: ProjectionVideoConfig,
+        session: CarLinkSessionToken = currentToken!!,
+    ) {
+        listener?.onVideoConfig(session, config)
     }
 
     /** Test hook: pushes a typed video frame (developer harnesses). */
-    fun simulateVideoFrame(frame: ProjectionVideoFrame) {
-        listener?.onVideoFrame(frame)
+    fun simulateVideoFrame(
+        frame: ProjectionVideoFrame,
+        session: CarLinkSessionToken = currentToken!!,
+    ) {
+        listener?.onVideoFrame(session, frame)
     }
 
     /** Test hook: opens a typed audio stream (developer harnesses). */
-    fun simulateAudioStarted(format: CarLinkAudioFormat) {
-        listener?.onAudioStarted(format)
+    fun simulateAudioStarted(
+        format: CarLinkAudioFormat,
+        session: CarLinkSessionToken = currentToken!!,
+    ) {
+        listener?.onAudioStarted(session, format)
     }
 
     /** Test hook: pushes one raw audio access unit (developer harnesses). */
-    fun simulateAudioFrame(frame: CarLinkAudioFrame) {
-        listener?.onAudioFrame(frame)
+    fun simulateAudioFrame(
+        frame: CarLinkAudioFrame,
+        session: CarLinkSessionToken = currentToken!!,
+    ) {
+        listener?.onAudioFrame(session, frame)
     }
 
     /** Test hook: closes a typed audio stream (developer harnesses). */
-    fun simulateAudioStopped(streamId: Int) {
-        listener?.onAudioStopped(streamId)
+    fun simulateAudioStopped(
+        streamId: Int,
+        session: CarLinkSessionToken = currentToken!!,
+    ) {
+        listener?.onAudioStopped(session, streamId)
     }
 
-    /** Test hook: pushes a fake session end through the listener. */
-    /** Test hook: reports a session start as if the SDK had connected. */
-    fun simulateSessionStarted(device: CarLinkDevice) {
+    /** Test hook: pushes a metadata update (developer harnesses). */
+    fun simulateMetadata(
+        metadata: ProjectionMetadata,
+        session: CarLinkSessionToken = currentToken!!,
+    ) {
+        listener?.onMetadata(session, metadata)
+    }
+
+    /**
+     * Test hook: reports a session start as if the SDK had connected.
+     * [session] defaults to the token of the latest connect request but can be
+     * an OLD token to simulate a stale late session-start.
+     */
+    fun simulateSessionStarted(
+        device: CarLinkDevice,
+        session: CarLinkSessionToken = currentToken ?: connectTokens.last(),
+    ) {
         connected = device
+        currentToken = session
         connectCount += 1
-        listener?.onSessionStarted(device)
+        listener?.onSessionStarted(session, device)
     }
 
-    fun simulateSessionEnd(reason: String) {
-        val device = connected ?: return
-        connected = null
-        listener?.onSessionEnded(reason)
+    /**
+     * Test hook: reports a session end. [session] defaults to the current
+     * token but can be an OLD token to simulate a stale trailing end.
+     */
+    fun simulateSessionEnd(
+        reason: String,
+        session: CarLinkSessionToken = currentToken ?: connectTokens.last(),
+    ) {
+        listener?.onSessionEnded(session, reason)
     }
 
     companion object {
@@ -258,7 +324,7 @@ class UnavailableCarLinkProtocolAdapter : CarLinkProtocolAdapter {
     override fun dispose() {}
     override fun startDiscovery() {}
     override fun stopDiscovery() {}
-    override fun connect(device: CarLinkDevice) {}
+    override fun connect(device: CarLinkDevice, session: CarLinkSessionToken) {}
     override fun disconnect() {}
     override fun sendTouch(event: ProjectionTouchEvent) {}
     override fun sendKey(event: ProjectionKeyEvent) {}

@@ -35,9 +35,9 @@ class CarLinkConnectResolutionTest {
         override fun dispose() = delegate.dispose()
         override fun startDiscovery() = delegate.startDiscovery()
         override fun stopDiscovery() = delegate.stopDiscovery()
-        override fun connect(device: CarLinkDevice) {
+        override fun connect(device: CarLinkDevice, session: CarLinkSessionToken) {
             connected.add(device.deviceId)
-            delegate.connect(device)
+            delegate.connect(device, session)
         }
 
         override fun disconnect() = delegate.disconnect()

@@ -57,9 +57,11 @@ class CarLinkController(
     private val sessionListeners =
         java.util.concurrent.CopyOnWriteArrayList<(CarLinkSessionEvent) -> Unit>()
 
-    /** Sinks of the active session, closed when it ends. */
-    @Volatile
+    /** Sinks of the active session, closed when it ends. Owned by one token. */
     private var sessionMedia: CarLinkMediaSinks? = null
+
+    /** The token whose session owns [sessionMedia]; teardown may only close its own. */
+    private var sessionMediaToken: CarLinkSessionToken? = null
 
     @Volatile
     var currentDevice: CarLinkDevice? = null
@@ -70,27 +72,24 @@ class CarLinkController(
         private set
 
     /**
-     * Session epoch bookkeeping: every connect attempt gets a fresh epoch and
-     * callbacks are interpreted against the epoch of the session they belong
-     * to. A real adapter backed by an SDK with session identity (sessionId,
-     * handle, connectionId) should prefer that identity; this counter is the
-     * controller-level fallback.
+     * Session identity: one [CarLinkSessionToken] per connect attempt, minted
+     * here and echoed by every session callback. Stale callbacks are detected
+     * by IDENTITY COMPARISON — never by arrival counting, order or timing.
+     *
+     * All session state ([pendingSessionToken], [activeSessionToken],
+     * [sessionMedia] ownership, [currentDevice], [sessionActive]) is guarded by
+     * [sessionLock] so SDK callbacks from different worker threads are safe.
+     * Long-running work (media close, SDK calls) happens outside the lock.
      */
-    private var nextSessionEpoch = 0L
+    private val sessionLock = Any()
 
-    @Volatile
-    private var currentSessionEpoch = 0L
+    private val nextSessionToken = java.util.concurrent.atomic.AtomicLong()
 
-    /**
-     * Trailing-end guard: sessions torn down non-normally (FATAL error, adapter
-     * failure mid-connect/disconnect, media-acquire failure) may still deliver
-     * their `onSessionEnded` afterwards. Such an end belongs to a DEAD session
-     * and must never overwrite a newer session's state (e.g. publish Ready over
-     * Connecting/Connected) or tear down a newer live session. Counted because
-     * more than one dead session can owe an end.
-     */
-    @Volatile
-    private var staleEndsExpected = 0
+    /** The in-flight connect attempt's token; consumed by its onSessionStarted. */
+    private var pendingSessionToken: CarLinkSessionToken? = null
+
+    /** The live session's token; all media/session callbacks must match it. */
+    private var activeSessionToken: CarLinkSessionToken? = null
 
     init {
         adapter.setListener(Listener())
@@ -129,7 +128,7 @@ class CarLinkController(
                 CarLinkProjectionBackend.PROVIDER_UNAVAILABLE_MESSAGE,
             )
         }
-        return guarded("initialize") {
+        return guarded("initialize", null) {
             adapter.initialize()
             diagnostics.event("initialize", "provider=${adapter.providerName}")
         }
@@ -144,11 +143,11 @@ class CarLinkController(
         }
         discovered.clear()
         diagnostics.event("discovering")
-        return guarded("startDiscovery") { adapter.startDiscovery() }
+        return guarded("startDiscovery", null) { adapter.startDiscovery() }
     }
 
     fun stopDiscovery() {
-        guarded("stopDiscovery") { adapter.stopDiscovery() }
+        guarded("stopDiscovery", null) { adapter.stopDiscovery() }
     }
 
     /**
@@ -207,22 +206,26 @@ class CarLinkController(
             return CarLinkOperationResult.Failure("CONNECT_FAILED", message)
         }
         diagnostics.event("connecting", "device=${target.deviceId}")
-        currentSessionEpoch = synchronized(this) { ++nextSessionEpoch }
-        return guarded("connect") { adapter.connect(target) }
+        // Mint this attempt's session token BEFORE the adapter call; every
+        // callback of this session must echo it back.
+        val token = CarLinkSessionToken(nextSessionToken.incrementAndGet())
+        synchronized(sessionLock) {
+            pendingSessionToken = token
+            activeSessionToken = null
+        }
+        return guarded("connect", token) { adapter.connect(target, token) }
     }
 
     fun disconnect(): CarLinkOperationResult {
-        // An explicit disconnect ends the CURRENT session: the upcoming
-        // onSessionEnded belongs to it, not to some earlier dead session.
-        staleEndsExpected = 0
-        return guarded("disconnect") { adapter.disconnect() }
+        val token = synchronized(sessionLock) { activeSessionToken ?: pendingSessionToken }
+        return guarded("disconnect", token) { adapter.disconnect() }
     }
 
     fun dispose() {
         try {
-            guarded("dispose") { adapter.dispose() }
+            guarded("dispose", null) { adapter.dispose() }
         } finally {
-            teardownSession("dispose")
+            teardownSession("dispose", null)
             discovered.clear()
         }
     }
@@ -231,21 +234,24 @@ class CarLinkController(
 
     fun offMetadata(listener: (ProjectionMetadata) -> Unit) = metadata.removeListener(listener)
 
-    /** Runs an adapter call; failures become session errors, never exceptions. */
-    private fun guarded(operation: String, block: () -> Unit): CarLinkOperationResult {
+    /**
+     * Runs an adapter call; failures become session errors, never exceptions.
+     * [token] scopes the failure to the session it concerns (null = provider).
+     */
+    private fun guarded(
+        operation: String,
+        token: CarLinkSessionToken?,
+        block: () -> Unit,
+    ): CarLinkOperationResult {
         return try {
             block()
             CarLinkOperationResult.Success
         } catch (error: Exception) {
             diagnostics.event(
                 "adapter-failed",
-                "op=$operation error=${error.javaClass.simpleName}",
+                "op=$operation error=${error.javaClass.simpleName} session=$token",
             )
-            // A session in flight (connect/disconnect) or an active one may owe
-            // a trailing onSessionEnded after this teardown.
-            val trailingPossible = sessionActive ||
-                operation == "connect" || operation == "disconnect"
-            teardownSession(operation, trailingEndPossible = trailingPossible)
+            teardownSession(operation, token)
             val message = "CarLink adapter $operation failed: ${error.javaClass.simpleName}"
             emit(
                 CarLinkSessionEvent.Error(
@@ -259,41 +265,67 @@ class CarLinkController(
     }
 
     /**
-     * Clears session and channel state after a session ends or fails.
-     *
-     * [trailingEndPossible] arms the trailing-end guard: the torn-down SDK
-     * session may still deliver its `onSessionEnded`, and that callback must
-     * later be recognized as belonging to this DEAD session (ignored with a
-     * diagnostic) instead of overwriting or tearing down a newer one.
+     * Clears the session state of [token] (or the current one when null, e.g.
+     * dispose). Only the OWNED session may be torn down: a teardown of dead
+     * session A must never close session B's media sinks or channels. Media
+     * close and SDK calls run outside [sessionLock].
      */
-    private fun teardownSession(reason: String, trailingEndPossible: Boolean = false) {
-        val wasActive = sessionActive
-        sessionActive = false
-        currentDevice = null
-        audio.stopAll()
-        video.onActive(false)
-        video.unbind()
-        audio.unbind()
-        val media = sessionMedia
-        sessionMedia = null
-        if (media != null) {
+    private fun teardownSession(reason: String, token: CarLinkSessionToken?) {
+        val mediaToClose: CarLinkMediaSinks?
+        val wasActive: Boolean
+        synchronized(sessionLock) {
+            val owned = token == null ||
+                token == activeSessionToken ||
+                token == pendingSessionToken
+            if (!owned) {
+                // Stale teardown of an old session: never touch the current one.
+                return
+            }
+            wasActive = sessionActive
+            if (token != null) {
+                if (activeSessionToken == token) activeSessionToken = null
+                if (pendingSessionToken == token) pendingSessionToken = null
+            } else {
+                activeSessionToken = null
+                pendingSessionToken = null
+            }
+            sessionActive = false
+            currentDevice = null
+            audio.stopAll()
+            video.onActive(false)
+            video.unbind()
+            audio.unbind()
+            mediaToClose = sessionMedia
+            sessionMedia = null
+            sessionMediaToken = null
+        }
+        if (mediaToClose != null) {
             try {
-                media.close()
+                mediaToClose.close()
             } catch (error: Exception) {
                 diagnostics.event("media-close-failed", "error=${error.javaClass.simpleName}")
             }
         }
-        if (trailingEndPossible) staleEndsExpected++
         if (wasActive) {
             diagnostics.event(
                 "session-torn-down",
-                "reason=${CarLinkDiagnostics.redact(reason)} epoch=$currentSessionEpoch",
+                "reason=${CarLinkDiagnostics.redact(reason)} session=$token",
             )
         }
     }
 
     private fun emit(event: CarLinkSessionEvent) {
         for (listener in sessionListeners) listener(event)
+    }
+
+    /** True when [session] is the current pending or active session. */
+    private fun isCurrent(session: CarLinkSessionToken): Boolean =
+        synchronized(sessionLock) {
+            session == activeSessionToken || session == pendingSessionToken
+        }
+
+    private fun staleDiagnostic(kind: String, session: CarLinkSessionToken) {
+        diagnostics.event("stale-session-callback-ignored", "kind=$kind session=$session")
     }
 
     private inner class Listener : CarLinkProtocolListener {
@@ -309,15 +341,31 @@ class CarLinkController(
             for (listener in deviceListeners) listener(snapshot)
         }
 
-        override fun onSessionStarted(device: CarLinkDevice) {
-            currentDevice = device
-            sessionActive = true
-            diagnostics.event("connected", "device=${device.deviceId}")
+        override fun onSessionStarted(session: CarLinkSessionToken, device: CarLinkDevice) {
+            // Only the pending connect attempt may start a session. A late
+            // start of an old (failed/replaced) attempt must not mark a session
+            // active, steal currentDevice, or acquire media sinks.
+            val accepted = synchronized(sessionLock) {
+                if (session != pendingSessionToken) {
+                    false
+                } else {
+                    pendingSessionToken = null
+                    activeSessionToken = session
+                    currentDevice = device
+                    sessionActive = true
+                    true
+                }
+            }
+            if (!accepted) {
+                staleDiagnostic("session-start", session)
+                return
+            }
+            diagnostics.event("connected", "device=${device.deviceId} session=$session")
             val media = try {
                 mediaSinks.acquire()
             } catch (error: Exception) {
                 diagnostics.event("media-acquire-failed", "error=${error.javaClass.simpleName}")
-                teardownSession("media-acquire-failed", trailingEndPossible = true)
+                teardownSession("media-acquire-failed", session)
                 emit(
                     CarLinkSessionEvent.Error(
                         "ADAPTER_FAILURE",
@@ -327,64 +375,105 @@ class CarLinkController(
                 )
                 return
             }
-            sessionMedia = media
+            // Media ownership is bound to THIS session's token: a later
+            // teardown of some other session can never close it.
+            synchronized(sessionLock) {
+                if (activeSessionToken == session) {
+                    sessionMedia = media
+                    sessionMediaToken = session
+                }
+            }
             video.bind(media.video)
             audio.bind(media.audio)
             video.onActive(true)
             emit(CarLinkSessionEvent.Connected(device.toProjectionDevice(backendId)))
         }
 
-        override fun onSessionEnded(reason: String) {
-            // Trailing-end guard: sessions torn down non-normally (FATAL error,
-            // adapter failure) may deliver their onSessionEnded afterwards.
-            // Such an end belongs to a DEAD session — consume it with a clear
-            // diagnostic and do NOT publish state changes (a late Ready would
-            // overwrite the latched Error or a newer Connecting/Connected) and
-            // do NOT tear down a newer live session or its media.
-            if (staleEndsExpected > 0) {
-                staleEndsExpected--
-                diagnostics.event(
-                    "stale-session-end-ignored",
-                    "reason=${CarLinkDiagnostics.redact(reason)} epoch=$currentSessionEpoch",
-                )
+        override fun onSessionEnded(session: CarLinkSessionToken, reason: String) {
+            // Identity comparison: an end of a DEAD session is stale — consume
+            // it with a diagnostic and never touch the current session, its
+            // media, its resources, or the visible state (a late Ready would
+            // overwrite the latched Error or a newer Connecting/Connected).
+            if (!isCurrent(session)) {
+                staleDiagnostic("session-end", session)
                 return
             }
-            teardownSession(reason)
+            teardownSession(reason, session)
             diagnostics.event("disconnected", "reason=${CarLinkDiagnostics.redact(reason)}")
             emit(CarLinkSessionEvent.Disconnected(CarLinkDiagnostics.redact(reason)))
         }
 
-        override fun onVideoConfig(config: com.shilapi.xcertplay.projection.ProjectionVideoConfig) {
+        override fun onVideoConfig(
+            session: CarLinkSessionToken,
+            config: com.shilapi.xcertplay.projection.ProjectionVideoConfig,
+        ) {
+            if (!isCurrent(session)) {
+                staleDiagnostic("video-config", session)
+                return
+            }
             video.onConfig(config)
         }
 
-        override fun onVideoFrame(frame: com.shilapi.xcertplay.projection.ProjectionVideoFrame) {
+        override fun onVideoFrame(
+            session: CarLinkSessionToken,
+            frame: com.shilapi.xcertplay.projection.ProjectionVideoFrame,
+        ) {
+            // Old H264/H265 access units must never reach the new session's
+            // decoder — identity check first, then forward.
+            if (!isCurrent(session)) {
+                staleDiagnostic("video-frame", session)
+                return
+            }
             video.onFrame(frame)
         }
 
-        override fun onAudioStarted(format: CarLinkAudioFormat) {
+        override fun onAudioStarted(session: CarLinkSessionToken, format: CarLinkAudioFormat) {
+            if (!isCurrent(session)) {
+                staleDiagnostic("audio-started", session)
+                return
+            }
             audio.start(format)
         }
 
-        override fun onAudioFrame(frame: CarLinkAudioFrame) {
+        override fun onAudioFrame(session: CarLinkSessionToken, frame: CarLinkAudioFrame) {
+            if (!isCurrent(session)) {
+                staleDiagnostic("audio-frame", session)
+                return
+            }
             audio.frame(frame)
         }
 
-        override fun onAudioStopped(streamId: Int) {
+        override fun onAudioStopped(session: CarLinkSessionToken, streamId: Int) {
+            if (!isCurrent(session)) {
+                staleDiagnostic("audio-stopped", session)
+                return
+            }
             audio.stop(streamId)
         }
 
-        override fun onMetadata(metadata: ProjectionMetadata) {
+        override fun onMetadata(session: CarLinkSessionToken, metadata: ProjectionMetadata) {
+            if (!isCurrent(session)) {
+                staleDiagnostic("metadata", session)
+                return
+            }
             this@CarLinkController.metadata.publish(metadata)
         }
 
         override fun onError(
+            session: CarLinkSessionToken?,
             code: String,
             message: String,
             severity: CarLinkErrorSeverity,
             cause: Throwable?,
         ) {
             val redacted = CarLinkDiagnostics.redact(message)
+            // A session-scoped error of a DEAD session is stale (e.g. a late
+            // FATAL of session A must not tear down session B). Provider errors
+            // (session == null) always apply.
+            if (session != null && !isCurrent(session)) {
+                staleDiagnostic("error", session)
+                return
+            }
             when (severity) {
                 CarLinkErrorSeverity.RECOVERABLE -> {
                     // Transient failure: log as a diagnostic and keep the
@@ -393,9 +482,11 @@ class CarLinkController(
                     emit(CarLinkSessionEvent.Error(code, redacted, cause, CarLinkErrorSeverity.RECOVERABLE))
                 }
                 CarLinkErrorSeverity.FATAL -> {
-                    diagnostics.event("error-fatal", "code=$code message=$redacted")
-                    // The dead SDK session usually still reports its end later.
-                    teardownSession("fatal:$code", trailingEndPossible = true)
+                    diagnostics.event("error-fatal", "code=$code message=$redacted session=$session")
+                    // Tear down the session this error belongs to. Its later
+                    // onSessionEnded carries the same token and is then stale
+                    // by identity — no counting needed.
+                    teardownSession("fatal:$code", session)
                     emit(CarLinkSessionEvent.Error(code, redacted, cause, CarLinkErrorSeverity.FATAL))
                 }
             }

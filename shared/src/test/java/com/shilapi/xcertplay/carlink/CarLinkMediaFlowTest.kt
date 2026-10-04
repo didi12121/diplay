@@ -226,7 +226,7 @@ class CarLinkMediaFlowTest {
     @Test
     fun adapterExceptionBecomesProjectionStateErrorWithCause() {
         val adapter = object : CarLinkProtocolAdapter by MockCarLinkProtocolAdapter() {
-            override fun connect(device: CarLinkDevice) {
+            override fun connect(device: CarLinkDevice, session: CarLinkSessionToken) {
                 throw IllegalStateException("sdk exploded")
             }
         }

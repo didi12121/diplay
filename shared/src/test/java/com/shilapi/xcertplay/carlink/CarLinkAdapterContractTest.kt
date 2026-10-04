@@ -40,12 +40,17 @@ class CarLinkAdapterContractTest {
     /**
      * Minimal compliant adapter: SDK callbacks come in through the public
      * `onXxx` methods a real SDK would call; everything else is a no-op like a
-     * real transport wrapper.
+     * real transport wrapper. It binds the controller-minted token to its
+     * "SDK session" and echoes it back — the real-adapter contract.
      */
     private class ContractAdapter : CarLinkProtocolAdapter {
         override val providerName = "contract-fake"
         override val isAvailable = true
         private var listener: CarLinkProtocolListener? = null
+
+        /** Token received at connect; echoed on every callback. */
+        var boundToken: CarLinkSessionToken? = null
+            private set
 
         override fun setListener(listener: CarLinkProtocolListener?) {
             this.listener = listener
@@ -53,16 +58,37 @@ class CarLinkAdapterContractTest {
 
         // SDK entry points a real adapter would wire to the ICCOA stack.
         fun sdkDeviceFound(device: CarLinkDevice) = listener!!.onDeviceFound(device)
-        fun sdkSessionStarted(device: CarLinkDevice) = listener!!.onSessionStarted(device)
-        fun sdkVideoConfig(config: ProjectionVideoConfig) = listener!!.onVideoConfig(config)
-        fun sdkVideoFrame(frame: ProjectionVideoFrame) = listener!!.onVideoFrame(frame)
-        fun sdkAudioStarted(format: CarLinkAudioFormat) = listener!!.onAudioStarted(format)
-        fun sdkAudioFrame(frame: CarLinkAudioFrame) = listener!!.onAudioFrame(frame)
-        fun sdkAudioStopped(streamId: Int) = listener!!.onAudioStopped(streamId)
-        fun sdkMetadata(metadata: ProjectionMetadata) = listener!!.onMetadata(metadata)
-        fun sdkSessionEnded(reason: String) = listener!!.onSessionEnded(reason)
-        fun sdkError(code: String, message: String, severity: CarLinkErrorSeverity, cause: Throwable? = null) =
-            listener!!.onError(code, message, severity, cause)
+        fun sdkSessionStarted(device: CarLinkDevice, session: CarLinkSessionToken = boundToken!!) =
+            listener!!.onSessionStarted(session, device)
+
+        fun sdkVideoConfig(config: ProjectionVideoConfig, session: CarLinkSessionToken = boundToken!!) =
+            listener!!.onVideoConfig(session, config)
+
+        fun sdkVideoFrame(frame: ProjectionVideoFrame, session: CarLinkSessionToken = boundToken!!) =
+            listener!!.onVideoFrame(session, frame)
+
+        fun sdkAudioStarted(format: CarLinkAudioFormat, session: CarLinkSessionToken = boundToken!!) =
+            listener!!.onAudioStarted(session, format)
+
+        fun sdkAudioFrame(frame: CarLinkAudioFrame, session: CarLinkSessionToken = boundToken!!) =
+            listener!!.onAudioFrame(session, frame)
+
+        fun sdkAudioStopped(streamId: Int, session: CarLinkSessionToken = boundToken!!) =
+            listener!!.onAudioStopped(session, streamId)
+
+        fun sdkMetadata(metadata: ProjectionMetadata, session: CarLinkSessionToken = boundToken!!) =
+            listener!!.onMetadata(session, metadata)
+
+        fun sdkSessionEnded(reason: String, session: CarLinkSessionToken = boundToken!!) =
+            listener!!.onSessionEnded(session, reason)
+
+        fun sdkError(
+            code: String,
+            message: String,
+            severity: CarLinkErrorSeverity,
+            cause: Throwable? = null,
+            session: CarLinkSessionToken? = boundToken,
+        ) = listener!!.onError(session, code, message, severity, cause)
 
         // Connection side: remember what the host asked for.
         val connectRequests = mutableListOf<CarLinkDevice>()
@@ -73,8 +99,9 @@ class CarLinkAdapterContractTest {
         override fun dispose() {}
         override fun startDiscovery() {}
         override fun stopDiscovery() {}
-        override fun connect(device: CarLinkDevice) {
+        override fun connect(device: CarLinkDevice, session: CarLinkSessionToken) {
             connectRequests.add(device)
+            boundToken = session
         }
 
         override fun disconnect() {}
@@ -157,6 +184,10 @@ class CarLinkAdapterContractTest {
 
         controller.connect(null)
         assertEquals(listOf(phone), adapter.connectRequests)
+        // Token contract: the controller minted a token, the adapter received
+        // it at connect, and every accepted callback echoes it back.
+        val session = adapter.boundToken
+        assertTrue("controller must mint a session token", session != null)
 
         adapter.sdkSessionStarted(phone)
 
@@ -278,5 +309,41 @@ class CarLinkAdapterContractTest {
         adapter.sdkError("LINK_LOST", "usb unplugged", CarLinkErrorSeverity.FATAL)
         assertTrue(!backend.isSessionActive)
         assertTrue(backend.state is ProjectionState.Error)
+    }
+
+    @Test
+    fun wrongOrStaleTokenIsIgnored() {
+        val adapter = ContractAdapter()
+        val video = RecordingVideo()
+        val audio = RecordingAudio()
+        val controller = CarLinkController(
+            adapter = adapter,
+            mediaSinks = StaticCarLinkMediaSinkProvider(video, audio),
+        )
+        controller.initialize()
+        controller.startDiscovery()
+        val phone = CarLinkDevice("iccoa-4", "Xiaomi 15", "xiaomi", ProjectionTransport.USB)
+        adapter.sdkDeviceFound(phone)
+        controller.connect(null)
+        adapter.sdkSessionStarted(phone)
+        val goodToken = adapter.boundToken!!
+        assertTrue(controller.sessionActive)
+
+        // A fabricated/wrong token is refused for every callback kind.
+        val wrong = CarLinkSessionToken(goodToken.value + 999)
+        adapter.sdkVideoFrame(
+            ProjectionVideoFrame(ProjectionVideoCodec.H264, 10, 10, 1, true, byteArrayOf(1)),
+            session = wrong,
+        )
+        adapter.sdkSessionEnded("fake end", session = wrong)
+        adapter.sdkError("BOGUS", "fake fatal", CarLinkErrorSeverity.FATAL, session = wrong)
+
+        // Session unaffected: still active, no frames, no teardown.
+        assertTrue(controller.sessionActive)
+        assertEquals(0, video.frames.size)
+
+        // The real token still works afterwards.
+        adapter.sdkSessionEnded("real end", session = goodToken)
+        assertTrue(!controller.sessionActive)
     }
 }

@@ -94,12 +94,15 @@ fallback for streams without timestamps (CarPlay).
 - A **FATAL** error latches `Error`: a trailing `onSessionEnded` of the same
   failing session only completes cleanup/release and must not reset the state
   to Ready. The next `initialize`/`start`/`connect` clears the latch.
-- **Stale session ends are isolated** (trailing-end guard / session epoch):
-  sessions torn down non-normally may still deliver their `onSessionEnded`
-  afterwards. Such a callback is consumed with a `stale-session-end-ignored`
-  diagnostic and can never overwrite a newer attempt's state (Ready over
-  Connecting), tear down a newer live session, release its lease or close its
-  media sinks. An explicit `disconnect()` of the current session always works.
+- **Session callbacks carry real session identity** (`CarLinkSessionToken`, one
+  per connect attempt, minted by the controller and echoed by every callback).
+  A late callback from an old session is rejected by IDENTITY COMPARISON —
+  never by arrival counting — and is logged as
+  `stale-session-callback-ignored`. It can never overwrite a newer attempt's
+  state, tear down a newer live session, release its lease, close its media
+  sinks, or feed stale frames to the new decoders. Errors are scoped too:
+  `onError(session = null, …)` is a provider/global error,
+  `onError(session = token, …)` belongs to that session only.
 
 ## What `OfficialCarLinkSdkAdapter` must implement
 
@@ -109,17 +112,32 @@ responsible **only** for translating SDK callbacks into typed events:
 ```
 initialize / dispose                      — SDK init/teardown
 startDiscovery / stopDiscovery            — + onDeviceFound(CarLinkDevice)
-connect(device) / disconnect()            — + onSessionStarted / onSessionEnded
-onVideoConfig(ProjectionVideoConfig)      — codec, codecData, width, height
-onVideoFrame(ProjectionVideoFrame)        — PTS, keyframe, payload window
-onAudioStarted(CarLinkAudioFormat)        — streamId, role, codec, sampleRate,
+connect(device, token) / disconnect()     — token minted by the controller;
+                                            adapter binds it to the SDK session
+                                            identity (sessionHandle/connectionId)
+                                            and echoes it on EVERY callback
+onSessionStarted(token, device)           — session-scoped
+onSessionEnded(token, reason)             — session-scoped
+onVideoConfig(token, ProjectionVideoConfig)  — codec, codecData, width, height
+onVideoFrame(token, ProjectionVideoFrame)    — PTS, keyframe, payload window
+onAudioStarted(token, CarLinkAudioFormat)    — streamId, role, codec, sampleRate,
                                             channels, sampleFormat (PCM endianness)
-onAudioFrame(CarLinkAudioFrame)           — PTS + payload window
-onAudioStopped(streamId)
-sendTouch / sendKey                       — unified input uplink
-onMetadata(ProjectionMetadata)            — now playing / navigation
-onError(code, message, severity, cause)   — RECOVERABLE vs FATAL mapping
+onAudioFrame(token, CarLinkAudioFrame)       — PTS + payload window
+onAudioStopped(token, streamId)
+sendTouch / sendKey                       — input to the CURRENT session's handle
+onMetadata(token, ProjectionMetadata)     — now playing / navigation
+onError(session?, code, message, severity, cause)
+                                        — session==null: provider/global error
+                                          session!=null: that session's error
+                                          RECOVERABLE vs FATAL mapping
 ```
+
+**Session identity is the adapter's responsibility**: map
+`CarLinkSessionToken ↔ sdk sessionHandle` and translate SDK callbacks back to
+the token. If the SDK has no session identity of its own, the adapter must
+fully stop the previous session's callback workers before binding the next
+token — otherwise stale callbacks cannot be told apart and the isolation above
+cannot work.
 
 It is **not** responsible for: MediaCodec, AudioTrack, Activity, SurfaceView,
 resource arbitration, or backend switching — the shared stack does all of that.
@@ -139,10 +157,24 @@ whole chain (Surface → MediaCodec, access unit → AudioTrack), and show the
 held resources (`USB, AUDIO` vs `WIFI, AUDIO`). Release builds never show or
 register the mock — production always defaults to the Unavailable provider.
 
+## Phase 9 — official SDK acquisition route
+
+ICCOA official public information confirms a real
+**ICCOA Carlink 车端 SDK (vehicle-side SDK)** exists. Phase 9 acquisition goes
+through the official route only:
+
+1. ICCOA 官方接入 / 联盟开发者申请
+2. Carlink 接入资料、SDK、PRD
+3. 准入信息与认证测试用例
+4. Real-device validation (Xiaomi CarWith / vivo Jovi InCar / OPPO Car+)
+
+**No reverse engineering, no cracked SDKs, no captured credentials, no
+guessed ports/handshakes/packet formats** — ever.
+
 ## Remaining blockers for real-device testing
 
-1. **No official ICCOA CarLink SDK** — by design; only a legal provider can
-   unblock real connections.
+1. **No official ICCOA CarLink SDK yet** — unblocked only by the official
+   route above.
 2. **Real phone compatibility unverified** — Xiaomi CarWith / vivo Jovi InCar /
    OPPO Car+ can only be called "targets", never "compatible", until devices
    are actually tested in Phase 9.

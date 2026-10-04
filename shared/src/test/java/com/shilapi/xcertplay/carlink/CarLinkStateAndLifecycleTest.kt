@@ -33,9 +33,9 @@ class CarLinkStateAndLifecycleTest {
             delegate.startDiscovery()
         }
 
-        override fun connect(device: CarLinkDevice) {
+        override fun connect(device: CarLinkDevice, session: CarLinkSessionToken) {
             if ("connect" in throwOn) throw IllegalStateException("sdk connect exploded")
-            delegate.connect(device)
+            delegate.connect(device, session)
         }
 
         override fun disconnect() {
