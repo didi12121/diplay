@@ -550,11 +550,7 @@ private class VideoDecoder(
 
     private fun configureDecoder(config: VideoJob.Config) {
         val previous = lastConfig
-        if (
-            decoder != null &&
-            previous?.codec == config.codec &&
-            previous.codecData.contentEquals(config.codecData)
-        ) {
+        if (decoder != null && config.sameDecoderSetupAs(previous)) {
             if (!duplicateConfigLogged) {
                 duplicateConfigLogged = true
                 Log.i(TAG, "video decoder config unchanged; keeping existing decoder")

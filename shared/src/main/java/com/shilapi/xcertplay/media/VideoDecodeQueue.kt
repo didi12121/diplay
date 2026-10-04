@@ -12,7 +12,20 @@ internal sealed interface VideoJob {
         /** Real coded size from the protocol (0 = unknown, use sink defaults). */
         val width: Int = 0,
         val height: Int = 0,
-    ) : VideoJob
+    ) : VideoJob {
+        /**
+         * True when [previous] describes the SAME decoder setup: identical
+         * codec, CSD AND coded size. A size change (1280x720 → 1920x1080 with
+         * the same SPS/PPS) must force a reconfigure — never be treated as a
+         * duplicate config.
+         */
+        fun sameDecoderSetupAs(previous: Config?): Boolean =
+            previous != null &&
+                previous.codec == codec &&
+                previous.codecData.contentEquals(codecData) &&
+                previous.width == width &&
+                previous.height == height
+    }
 
     data class Frame(
         val nalus: ByteArray,
