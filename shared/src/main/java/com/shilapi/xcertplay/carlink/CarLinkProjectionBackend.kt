@@ -81,6 +81,15 @@ class CarLinkProjectionBackend(
     @Volatile
     private var currentTransport: ProjectionTransport = ProjectionTransport.UNKNOWN
 
+    /**
+     * Set when a FATAL adapter error tore the session down. While latched, the
+     * visible state stays `Error` — a trailing `onSessionEnded` of the same
+     * failing session must not overwrite it with Ready. Cleared only by the
+     * next user-driven operation (initialize / start / connect).
+     */
+    @Volatile
+    private var fatalErrorLatched = false
+
     private val controller = CarLinkController(
         adapter = adapter,
         mediaSinks = mediaSinks,
@@ -96,8 +105,19 @@ class CarLinkProjectionBackend(
 
     override fun requiredResourcesFor(device: ProjectionDevice?): Set<ProjectionResource> =
         CarLinkCapabilities.resourcesFor(
+            // A resolved device always wins; without one, fall back to the
+            // negotiated transport of the live/current session.
             device?.transport ?: currentTransport,
         )
+
+    /**
+     * The device `connect(requested)` would actually talk to: the requested one
+     * when given, otherwise the first discovered device — exactly the same
+     * choice [com.shilapi.xcertplay.carlink.CarLinkController.connect] makes,
+     * so arbitration and connection can never drift apart.
+     */
+    override fun resolveConnectDevice(requested: ProjectionDevice?): ProjectionDevice? =
+        controller.resolveConnectDevice(requested)
 
     override fun discoveredDevices(): List<ProjectionDevice> = controller.discoveredDevices()
 
@@ -126,6 +146,7 @@ class CarLinkProjectionBackend(
             publishProviderUnavailable()
             return
         }
+        fatalErrorLatched = false
         stateStore.publish(ProjectionState.Initializing)
         // Only advance to Ready on a real success: a failing adapter publishes
         // Error (via the session listener) and that Error must stay visible —
@@ -138,6 +159,7 @@ class CarLinkProjectionBackend(
 
     override fun start() {
         if (!adapter.isAvailable) return
+        fatalErrorLatched = false
         stateStore.publish(ProjectionState.Discovering)
         val result = controller.startDiscovery()
         if (!result.isSuccess) {
@@ -159,7 +181,12 @@ class CarLinkProjectionBackend(
             publishProviderUnavailable()
             return
         }
-        currentTransport = device?.transport ?: ProjectionTransport.UNKNOWN
+        fatalErrorLatched = false
+        // Same resolution as the manager's arbitration: the transport the
+        // resources are claimed for is the transport of the device actually
+        // connected (resolved device wins over a bare request).
+        currentTransport = controller.resolveConnectDevice(device)?.transport
+            ?: ProjectionTransport.UNKNOWN
         stateStore.publish(ProjectionState.Connecting)
         val result = controller.connect(device)
         if (!result.isSuccess) {
@@ -217,11 +244,26 @@ class CarLinkProjectionBackend(
                 stateStore.publish(ProjectionState.Connected)
             }
             is CarLinkSessionEvent.Disconnected -> {
-                stateStore.publish(ProjectionState.Ready)
-                // The session really ended: release arbitration hold.
+                // The session really ended: release arbitration hold first, then
+                // decide the visible state. A latched fatal Error must NOT be
+                // overwritten by Ready — the user has to see WHY it failed.
+                if (!fatalErrorLatched) {
+                    stateStore.publish(ProjectionState.Ready)
+                }
                 sessionStoppedListener?.run()
             }
             is CarLinkSessionEvent.Error -> {
+                if (event.severity == CarLinkErrorSeverity.RECOVERABLE) {
+                    // Transient failure: the session keeps running and its
+                    // resources stay claimed. Only the diagnostic is logged —
+                    // the state machine must not pretend the session is gone.
+                    logger.log("backend=$ID recoverable-error code=${event.code}")
+                    return
+                }
+                // FATAL: latch so a later onSessionEnded from the same failing
+                // session cannot reset the state to Ready. Only the next
+                // initialize / start / connect clears the latch.
+                fatalErrorLatched = true
                 val code = when (event.code) {
                     "PROVIDER_UNAVAILABLE" -> ProjectionErrorCode.PROVIDER_UNAVAILABLE
                     "CONNECT_FAILED" -> ProjectionErrorCode.CONNECT_FAILED

@@ -128,18 +128,43 @@ class CarLinkController(
         guarded("stopDiscovery") { adapter.stopDiscovery() }
     }
 
+    /**
+     * The device [connect] would actually talk to. [ProjectionManager] calls
+     * this BEFORE resource arbitration, so the claimed resources always match
+     * the device really connected (same list order as [connect]'s fallback).
+     */
+    fun resolveConnectDevice(requested: ProjectionDevice?): ProjectionDevice? {
+        if (requested != null) return requested
+        return discovered.firstOrNull()?.toProjectionDevice(backendId)
+    }
+
     fun connect(device: ProjectionDevice?): CarLinkOperationResult {
         if (!adapter.isAvailable) {
             val message = CarLinkProjectionBackend.PROVIDER_UNAVAILABLE_MESSAGE
-            emit(CarLinkSessionEvent.Error("PROVIDER_UNAVAILABLE", message))
+            emit(
+                CarLinkSessionEvent.Error(
+                    "PROVIDER_UNAVAILABLE",
+                    message,
+                    severity = CarLinkErrorSeverity.FATAL,
+                ),
+            )
             return CarLinkOperationResult.Failure("PROVIDER_UNAVAILABLE", message)
         }
-        val target = device?.let { projection ->
+        // Same resolution as resolveConnectDevice: never pick a different
+        // device than the manager arbitrated resources for.
+        val resolved = resolveConnectDevice(device)
+        val target = resolved?.let { projection ->
             discovered.firstOrNull { it.deviceId == projection.id }
         } ?: discovered.firstOrNull()
         if (target == null) {
             val message = "no CarLink device discovered yet"
-            emit(CarLinkSessionEvent.Error("CONNECT_FAILED", message))
+            emit(
+                CarLinkSessionEvent.Error(
+                    "CONNECT_FAILED",
+                    message,
+                    severity = CarLinkErrorSeverity.FATAL,
+                ),
+            )
             return CarLinkOperationResult.Failure("CONNECT_FAILED", message)
         }
         diagnostics.event("connecting", "device=${target.deviceId}")
@@ -279,9 +304,26 @@ class CarLinkController(
             this@CarLinkController.metadata.publish(metadata)
         }
 
-        override fun onError(code: String, message: String, cause: Throwable?) {
-            diagnostics.event("error", "code=$code message=${CarLinkDiagnostics.redact(message)}")
-            emit(CarLinkSessionEvent.Error(code, CarLinkDiagnostics.redact(message), cause))
+        override fun onError(
+            code: String,
+            message: String,
+            severity: CarLinkErrorSeverity,
+            cause: Throwable?,
+        ) {
+            val redacted = CarLinkDiagnostics.redact(message)
+            when (severity) {
+                CarLinkErrorSeverity.RECOVERABLE -> {
+                    // Transient failure: log as a diagnostic and keep the
+                    // session (and its resources) alive.
+                    diagnostics.event("error-recoverable", "code=$code message=$redacted")
+                    emit(CarLinkSessionEvent.Error(code, redacted, cause, CarLinkErrorSeverity.RECOVERABLE))
+                }
+                CarLinkErrorSeverity.FATAL -> {
+                    diagnostics.event("error-fatal", "code=$code message=$redacted")
+                    teardownSession("fatal:$code")
+                    emit(CarLinkSessionEvent.Error(code, redacted, cause, CarLinkErrorSeverity.FATAL))
+                }
+            }
         }
     }
 }
@@ -294,5 +336,6 @@ sealed class CarLinkSessionEvent {
         val code: String,
         val message: String,
         val cause: Throwable? = null,
+        val severity: CarLinkErrorSeverity = CarLinkErrorSeverity.FATAL,
     ) : CarLinkSessionEvent()
 }

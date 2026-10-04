@@ -46,10 +46,22 @@ interface ProjectionBackend : Closeable {
     /**
      * Shared resources needed when connecting to [device]. Defaults to
      * [requiredResources]; backends with per-session negotiation (e.g. USB vs
-     * wireless CarLink) override this.
+     * wireless CarLink) override this. `null` means "no known target" and
+     * should claim nothing speculative.
      */
     fun requiredResourcesFor(device: ProjectionDevice?): Set<ProjectionResource> =
         requiredResources
+
+    /**
+     * Resolves which device a `connect(requested)` would actually talk to, so
+     * the manager can claim resources for the SAME device the backend will
+     * really connect (never "manager thinks UNKNOWN, backend picks USB").
+     *
+     * Default: the requested device as-is. Backends whose connect(null) picks a
+     * discovered device must override this and return that device here too.
+     * Returning null means there is nothing to connect to right now.
+     */
+    fun resolveConnectDevice(requested: ProjectionDevice?): ProjectionDevice? = requested
 
     /** Devices discovery found so far; used by AUTO selection and connect(null). */
     fun discoveredDevices(): List<ProjectionDevice> = emptyList()

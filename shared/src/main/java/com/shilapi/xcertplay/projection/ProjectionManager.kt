@@ -214,6 +214,24 @@ class ProjectionManager(
         device: ProjectionDevice? = null,
         listener: ProjectionTakeoverListener? = null,
     ): ProjectionTakeoverOutcome {
+        // Explicit policy: one takeover at a time. A second request while one
+        // is awaiting an old session's stop is refused with a clear reason —
+        // it must never silently replace the pending takeover (that would drop
+        // the first listener and could activate the wrong target).
+        val pendingNow = synchronized(lock) { pendingTakeover }
+        if (pendingNow != null) {
+            val message = "TAKEOVER_IN_PROGRESS: takeover to ${pendingNow.targetId} is awaiting a stop"
+            logger.log("manager takeover-rejected $message")
+            listener?.onTakeoverFailed(targetId, message)
+            return ProjectionTakeoverOutcome.Blocked(
+                ProjectionResourceConflictException(
+                    message,
+                    resource = null,
+                    ownerBackendId = pendingNow.targetId,
+                    requestingBackendId = targetId,
+                ),
+            )
+        }
         val target = backend(targetId)
             ?: return ProjectionTakeoverOutcome.Blocked(
                 ProjectionResourceConflictException(
@@ -230,7 +248,26 @@ class ProjectionManager(
         }
         val remaining = blockers.firstOrNull { it.isSessionActive }
         if (remaining != null) {
-            synchronized(lock) { pendingTakeover = PendingTakeover(targetId, device, listener) }
+            val claimed = synchronized(lock) {
+                if (pendingTakeover != null) {
+                    false
+                } else {
+                    pendingTakeover = PendingTakeover(targetId, device, listener)
+                    true
+                }
+            }
+            if (!claimed) {
+                val message = "TAKEOVER_IN_PROGRESS: another takeover became pending concurrently"
+                listener?.onTakeoverFailed(targetId, message)
+                return ProjectionTakeoverOutcome.Blocked(
+                    ProjectionResourceConflictException(
+                        message,
+                        resource = null,
+                        ownerBackendId = remaining.id,
+                        requestingBackendId = targetId,
+                    ),
+                )
+            }
             logger.log("manager takeover-awaiting backend=${remaining.id} target=$targetId")
             return ProjectionTakeoverOutcome.AwaitingStop(remaining.id)
         }
@@ -348,6 +385,10 @@ class ProjectionManager(
     }
 
     private fun connectInternal(target: ProjectionBackend, device: ProjectionDevice?) {
+        // 0. Resolve the actual connect target FIRST: the device resources are
+        //    claimed for must be the very device the backend connects — never
+        //    "manager assumed UNKNOWN, backend picked a USB phone".
+        val resolved = target.resolveConnectDevice(device)
         // 1. A live session in any other backend is an absolute conflict: the
         //    caller must use takeover() for a controlled switch.
         val live = registeredBackends.firstOrNull { it.id != target.id && it.isSessionActive }
@@ -357,15 +398,19 @@ class ProjectionManager(
                 resource = null,
                 ownerBackendId = live.id,
                 requestingBackendId = target.id,
-                resources = target.requiredResourcesFor(device),
+                resources = target.requiredResourcesFor(resolved),
             )
             logger.log("manager connect-rejected backend=${target.id} owner=${live.id}")
             throw conflict
         }
         // 2. Confirmed-stopped backends must not keep hardware hostage.
         cleanupStoppedClaimsExcept(target.id)
-        // 3. Claim the resources this session needs.
-        val resources = target.requiredResourcesFor(device)
+        // 3. Claim the resources this session needs. The claim is computed for
+        //    the RESOLVED device (same one step 4 connects), so transport-based
+        //    claims (USB vs Wi-Fi CarLink) can never drift from reality. With
+        //    no resolved target the backend's "unknown device" set applies —
+        //    never a speculative USB/WIFI claim.
+        val resources = target.requiredResourcesFor(resolved ?: device)
         if (resources.isNotEmpty()) {
             try {
                 coordinator.acquire(target.id, resources)
@@ -379,8 +424,9 @@ class ProjectionManager(
         }
         synchronized(lock) { activeBackendId = target.id }
         notifySelection(target.id)
-        logger.log("manager connect backend=${target.id} device=${device?.id ?: "first"}")
-        target.connect(device)
+        logger.log("manager connect backend=${target.id} device=${resolved?.id ?: "unresolved"}")
+        // 4. Connect the SAME resolved device the resources were claimed for.
+        target.connect(resolved)
     }
 
     /** Releases claims left behind by backends whose sessions are confirmed gone. */
