@@ -614,7 +614,7 @@ class DiPlayActivity : ComponentActivity() {
     private var carLifeProbeStatus: TextView? = null
 
     private fun carLifePanel(content: LinearLayout) {
-        section(content, "Android CarLife — USB AOA Compatibility Probe") { card ->
+        section(content, "Android CarLife — USB AOA / Wireless AP Probe") { card ->
             if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0) {
                 // Release builds never expose the developer probe.
                 card.addView(TextView(this).apply { this.text = "CarLife probe is available in debug builds only." })
@@ -628,7 +628,10 @@ class DiPlayActivity : ComponentActivity() {
             carLifeProbeStatus = status
             card.addView(status, matchButton(4, -2))
             card.addView(button("Developer: CarLife USB Probe — start", false) {
-                startCarLifeProbe()
+                startCarLifeProbe(com.shilapi.xcertplay.projection.ProjectionTransport.USB)
+            }, matchButton(10, 60))
+            card.addView(button("Developer: CarLife Wireless AP — start", false) {
+                startCarLifeProbe(com.shilapi.xcertplay.projection.ProjectionTransport.WIFI)
             }, matchButton(10, 60))
             card.addView(button("Developer: CarLife probe — disconnect", false) {
                 ProjectionHost.manager.disconnectBackend(com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID)
@@ -641,9 +644,11 @@ class DiPlayActivity : ComponentActivity() {
     /**
      * Debug-only probe: initializes the open CarLife V2 provider with the
      * PUBLIC demo configuration (DEMO_CHANNEL — NOT FOR PRODUCTION —
-     * COMPATIBILITY UNVERIFIED) and starts one wired-AOA connect attempt.
+     * COMPATIBILITY UNVERIFIED) and starts one connect attempt over the
+     * requested transport (USB AOA or Wireless AP / same LAN). Only one CarLife
+     * attempt may be active at a time - the backend rejects mixed transports.
      */
-    private fun startCarLifeProbe() {
+    private fun startCarLifeProbe(transport: com.shilapi.xcertplay.projection.ProjectionTransport) {
         try {
             // ONE provider / ONE CarLife.init / ONE backend registration per
             // process. Start Probe reuses them — never new/re-init.
@@ -666,8 +671,13 @@ class DiPlayActivity : ComponentActivity() {
             ProjectionHost.manager.connect(
                 com.shilapi.xcertplay.projection.ProjectionDevice(
                     id = "carlife-phone",
-                    name = "Android phone (CarLife)",
+                    name = if (transport == com.shilapi.xcertplay.projection.ProjectionTransport.USB) {
+                        "Android phone (CarLife USB)"
+                    } else {
+                        "Android phone (CarLife Wireless AP)"
+                    },
                     backendId = com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID,
+                    transport = transport,
                 ),
             )
         } catch (conflict: com.shilapi.xcertplay.projection.ProjectionResourceConflictException) {
@@ -689,7 +699,10 @@ class DiPlayActivity : ComponentActivity() {
         val held = ProjectionHost.manager.resourcesHeldBy(com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID)
         status.text = buildString {
             appendLine("state: ${report.state}  blocker: ${report.blocker}")
+            appendLine("transport: ${report.transport}  local: ${report.localIp ?: "-"}  network: ${report.networkType ?: "-"}")
             appendLine("USB: ${report.usbDevice ?: "-"}   AOA: ${report.aoaState}")
+            appendLine("wireless: udp=${report.udpPort ?: "-"} listening=${report.udpListening} packets=${report.udpPacketsReceived} phone=${report.phoneIp ?: "-"}")
+            appendLine("tcp: cmd=${report.tcpCmd ?: "-"} video=${report.tcpVideo ?: "-"} audio=${report.tcpAudio ?: "-"} tts=${report.tcpTts ?: "-"} vr=${report.tcpVr ?: "-"} touch=${report.tcpTouch ?: "-"} update=${report.tcpUpdate ?: "-"} attached=${report.transportAttached}")
             appendLine("connection: ${report.connectionState}  protocolVersion: ${report.protocolVersion ?: "-"}")
             appendLine("phone CarLife protocol version: ${report.phoneCarlifeProtocolVersion ?: "0 (not reported)"}   auth: ${report.authResult ?: "-"}")
             appendLine("last error: ${report.lastError ?: "-"}")

@@ -204,6 +204,28 @@ class CarLifeReceiverImpl(
     }
 
     /**
+     * DiPlay lifecycle extension (Phase 9.2W-A, host-local only): transport
+     * reconfiguration WITHOUT auto-connect. See
+     * [CarLifeReceiver.configureConnectTypeWithoutStarting].
+     */
+    override fun configureConnectTypeWithoutStarting(type: Int) {
+        Logger.d(Constants.TAG, "configureConnectTypeWithoutStarting, $type")
+        // 1. fully stop the previous transport + suppress detach auto-reconnect
+        transport.shutdown()
+        // 2. the chosen transport family is part of the LOCAL feature set
+        //    (kept across detach resets; wire-visible feature list is not
+        //    affected differently than upstream setConnectType does)
+        setFeature(FEATURE_CONFIG_CONNECT_TYPE, type)
+        // 3. rebuild the local transport implementation only - NO connect()
+        transport.configConnectType()
+    }
+
+    /** DiPlay host-local extension (Phase 9.2W-A, diagnostics only). */
+    override fun setTransportProbeListener(listener: com.baidu.carlife.sdk.receiver.transport.wirless.WirlessTransportProbe?) {
+        transport.transportProbe = listener
+    }
+
+    /**
      *  监听usb广播消息，被动接受连接。
      */
     override fun ready() {

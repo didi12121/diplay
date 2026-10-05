@@ -9,6 +9,7 @@ import com.baidu.carlife.sdk.ConnectionChangeListener
 import com.baidu.carlife.sdk.receiver.CarLife
 import com.baidu.carlife.sdk.receiver.CarLifeReceiver
 import com.baidu.carlife.sdk.receiver.ConnectProgressListener
+import com.baidu.carlife.sdk.receiver.transport.wirless.WirlessTransportProbe
 
 /**
  * Narrow view of the CarLife SDK receiver used by [CarLifeV2Provider].
@@ -40,6 +41,15 @@ interface CarLifeReceiverFacade {
     fun onSurfaceSizeChanged(width: Int, height: Int) {}
     /** Synchronous high-level touch send (CarLifeReceiver.onTouchEvent). */
     fun onTouchEvent(event: MotionEvent) {}
+
+    // ---- Transport reconfiguration + wireless probe (Phase 9.2W-A) ----
+    /**
+     * Reconfigures the LOCAL transport family WITHOUT auto-connect (host-local
+     * seam, see CarLifeReceiver.configureConnectTypeWithoutStarting).
+     */
+    fun configureConnectTypeWithoutStarting(type: Int) {}
+    /** Diagnostics-only wireless transport probe (host-local). */
+    fun setTransportProbeListener(listener: WirlessTransportProbe?) {}
 }
 
 /**
@@ -78,14 +88,29 @@ class CarLifeV2Provider(
     private val lock = Any()
     private var facade: CarLifeReceiverFacade? = null
 
+    /** Application context for local network diagnostics (Phase 9.2W-A). */
+    @Volatile
+    private var appContext: Context? = null
+
+    /**
+     * Transport family the captured receiver is currently configured for
+     * (init configures USB AOA). Reconfiguration is host-local and never
+     * auto-connects; unchanged configuration is skipped so the proven USB
+     * path is byte-for-byte its Phase 9.1 behavior.
+     */
+    @Volatile
+    private var configuredConnectType: Int = CarLifeContext.CONNECTION_TYPE_AOA
+
     /** The attempt currently bound to SDK callbacks (token-bound listener). */
     private var attempt: Attempt? = null
 
     private class Attempt(
         val token: CarLifeSessionToken,
         val sink: (CarLifeConnectionEvent) -> Unit,
+        /** Transport of THIS attempt (Phase 9.2W-A); never a previous session's. */
+        val transport: CarLifeTransport = CarLifeTransport.USB_AOA,
     ) {
-        /** False until this attempt's connect() ran: registration replays and
+        /** False until this attempt's connect() ran: registration replay and
          *  leftovers of older attempts cannot masquerade as this session. */
         @Volatile
         var armed = false
@@ -110,10 +135,23 @@ class CarLifeV2Provider(
         @Volatile
         var pushedSurfaceHeight = -1
 
+        /** Wireless transport diagnostics of THIS attempt (Phase 9.2W-A). */
+        val wireless = WirelessState()
+
         fun emit(event: CarLifeConnectionEvent) {
             if (!armed) return // registration replay or pre-connect leftover
             sink(event) // event carries THIS attempt's fixed token
         }
+    }
+
+    /** Wireless transport diagnostics state (per attempt; no payloads). */
+    private class WirelessState {
+        @Volatile var udpListening = false
+        @Volatile var udpPort: Int? = null
+        @Volatile var phoneIp: String? = null
+        @Volatile var udpPackets = 0
+        @Volatile var transportAttached = false
+        val tcpChannels = java.util.concurrent.ConcurrentHashMap<Int, String>()
     }
 
     override fun initialize(context: Context, config: CarLifeProviderConfig) {
@@ -122,11 +160,20 @@ class CarLifeV2Provider(
             // a global singleton holding one receiver — a second init would
             // replace it and orphan the previous one.
             if (facade != null) return
+            appContext = context.applicationContext
             facade = facadeFactory(context, config)
         }
     }
 
     override fun startConnection(token: CarLifeSessionToken, listener: (CarLifeConnectionEvent) -> Unit) {
+        startConnection(token, CarLifeTransport.USB_AOA, listener)
+    }
+
+    override fun startConnection(
+        token: CarLifeSessionToken,
+        transport: CarLifeTransport,
+        listener: (CarLifeConnectionEvent) -> Unit,
+    ) {
         val facade = facade ?: error("CarLifeV2Provider.initialize() must run first")
         // ---- Fence the previous attempt BEFORE binding the new token ----
         val old = synchronized(lock) { attempt.also { attempt = null } }
@@ -135,13 +182,22 @@ class CarLifeV2Provider(
             //    contains it, so no further callback can reach the old sink;
             runCatching { facade.removeConnectionListener(old.listener) }
             runCatching { facade.removeProgressListener(old.progress) }
+            runCatching { facade.setTransportProbeListener(null) }
             detachVideo(old.token)
             // 2. fence the old transport: tear its attempt down AND suppress
             //    the detach auto-reconnect so it can never come back.
             runCatching { facade.shutdown() }
         }
+        // ---- Transport selection (Phase 9.2W-A): configure BEFORE arming,
+        // without starting any network/USB work. Skipped when unchanged so the
+        // USB AOA path keeps exactly its Phase 9.1 behavior. ----
+        val connectType = transport.connectType()
+        if (connectType != configuredConnectType) {
+            runCatching { facade.configureConnectTypeWithoutStarting(connectType) }
+            configuredConnectType = connectType
+        }
         // ---- Bind the new attempt ----
-        val current = Attempt(token, listener)
+        val current = Attempt(token, listener, transport)
         current.listener = connectionListenerFor(current, token)
         current.progress = progressListenerFor(current, token)
         synchronized(lock) { attempt = current }
@@ -149,6 +205,7 @@ class CarLifeV2Provider(
         // attempt is not armed yet, so those events are dropped.
         runCatching { facade.addConnectionListener(current.listener) }
         runCatching { facade.addProgressListener(current.progress) }
+        runCatching { facade.setTransportProbeListener(probeListenerFor(current, token)) }
         facade.connect()
         current.armed = true
     }
@@ -161,18 +218,69 @@ class CarLifeV2Provider(
         } ?: return
         runCatching { facade.removeConnectionListener(current.listener) }
         runCatching { facade.removeProgressListener(current.progress) }
+        runCatching { facade.setTransportProbeListener(null) }
         runCatching { facade.shutdown() }
     }
 
     override fun diagnostics(): CarLifeProviderDiagnostics {
         val facade = facade ?: return CarLifeProviderDiagnostics()
+        val current = synchronized(lock) { attempt }
+        val wireless = current?.wireless
         return CarLifeProviderDiagnostics(
             usbDevices = runCatching { facade.usbDeviceSummaries() }.getOrDefault(emptyList()),
             localProtocolVersion = runCatching { facade.protocolVersion() }.getOrNull(),
             phoneCarlifeProtocolVersion = runCatching { facade.carlifeVersion() }.getOrNull(),
             connectionState = runCatching { facade.connectionState() }.getOrDefault(0),
+            // ---- Transport / wireless (Phase 9.2W-A; IPs only, no SSID/MAC) ----
+            transport = current?.transport?.name ?: "USB_AOA",
+            localIp = localIpv4(),
+            networkType = activeNetworkType(),
+            udpPort = wireless?.udpPort,
+            udpListening = wireless?.udpListening ?: false,
+            phoneIp = wireless?.phoneIp,
+            udpPacketsReceived = wireless?.udpPackets ?: 0,
+            tcpChannels = wireless?.tcpChannels?.entries
+                ?.associate { channelName(it.key) to it.value } ?: emptyMap(),
+            transportAttached = wireless?.transportAttached ?: false,
         )
     }
+
+    /** Upstream MSG_CHANNEL_* id -> diagnostic name (no payloads). */
+    private fun channelName(channel: Int): String = when (channel) {
+        com.baidu.carlife.sdk.Constants.MSG_CHANNEL_CMD -> "cmd"
+        com.baidu.carlife.sdk.Constants.MSG_CHANNEL_VIDEO -> "video"
+        com.baidu.carlife.sdk.Constants.MSG_CHANNEL_AUDIO -> "audio"
+        com.baidu.carlife.sdk.Constants.MSG_CHANNEL_AUDIO_TTS -> "tts"
+        com.baidu.carlife.sdk.Constants.MSG_CHANNEL_AUDIO_VR -> "vr"
+        com.baidu.carlife.sdk.Constants.MSG_CHANNEL_TOUCH -> "touch"
+        com.baidu.carlife.sdk.Constants.MSG_CHANNEL_UPDATE -> "update"
+        else -> "ch$channel"
+    }
+
+    /** First active non-loopback IPv4 (diagnostic only). */
+    private fun localIpv4(): String? = runCatching {
+        val interfaces = java.net.NetworkInterface.getNetworkInterfaces() ?: return null
+        java.util.Collections.list(interfaces).asSequence()
+            .filter { runCatching { it.isUp }.getOrDefault(false) && !it.isLoopback }
+            .flatMap { java.util.Collections.list(it.inetAddresses).asSequence() }
+            .filterIsInstance<java.net.Inet4Address>()
+            .firstOrNull { !it.isLoopbackAddress }
+            ?.hostAddress
+    }.getOrNull()
+
+    /** Active network transport type (diagnostic only; no SSID/MAC). */
+    private fun activeNetworkType(): String? = runCatching {
+        val context = appContext ?: return null
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as? android.net.ConnectivityManager ?: return null
+        val capabilities = manager.getNetworkCapabilities(manager.activeNetwork) ?: return null
+        when {
+            capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+            capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
+            capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
+            else -> "OTHER"
+        }
+    }.getOrNull()
 
     private val videoBridges = java.util.concurrent.ConcurrentHashMap<CarLifeSessionToken, CarLifeVideoBridge>()
 
@@ -238,6 +346,7 @@ class CarLifeV2Provider(
             runCatching { facade.removeConnectionListener(current.listener) }
             runCatching { facade.removeProgressListener(current.progress) }
         }
+        runCatching { facade.setTransportProbeListener(null) }
         runCatching { facade.shutdown() }
     }
 
@@ -272,6 +381,60 @@ class CarLifeV2Provider(
     ): ConnectProgressListener = object : ConnectProgressListener {
         override fun onProgress(progress: Int) {
             attempt.emit(CarLifeConnectionEvent.Progress(token, progress))
+        }
+    }
+
+    /**
+     * Wireless transport probe bound to ONE attempt (Phase 9.2W-A): a late
+     * callback of a superseded/dead attempt can never mutate the current
+     * attempt's diagnostics or emit its stages.
+     */
+    private fun probeListenerFor(
+        attempt: Attempt,
+        token: CarLifeSessionToken,
+    ): WirlessTransportProbe = object : WirlessTransportProbe {
+        private fun live(): Boolean =
+            synchronized(lock) { this@CarLifeV2Provider.attempt }?.let { it === attempt && it.armed } == true
+
+        private fun stage(stage: CarLifeProbeState) {
+            attempt.emit(CarLifeConnectionEvent.WirelessStage(token, stage))
+        }
+
+        override fun onUdpListening(port: Int) {
+            if (!live()) return
+            attempt.wireless.udpListening = true
+            attempt.wireless.udpPort = port
+            stage(CarLifeProbeState.WIFI_UDP_LISTENING)
+        }
+
+        override fun onUdpStopped() {
+            if (!live()) return
+            attempt.wireless.udpListening = false
+        }
+
+        override fun onUdpPacketReceived(fromIp: String, total: Int) {
+            if (!live()) return
+            attempt.wireless.phoneIp = fromIp
+            attempt.wireless.udpPackets = total
+            stage(CarLifeProbeState.WIFI_PHONE_DISCOVERED)
+        }
+
+        override fun onTcpConnecting(host: String) {
+            if (!live()) return
+            attempt.wireless.phoneIp = host
+            stage(CarLifeProbeState.WIFI_TCP_CONNECTING)
+        }
+
+        override fun onTcpChannelState(channel: Int, port: Int, state: String, error: String?) {
+            if (!live()) return
+            attempt.wireless.tcpChannels[channel] = state
+        }
+
+        override fun onTransportAttached(host: String) {
+            if (!live()) return
+            attempt.wireless.phoneIp = host
+            attempt.wireless.transportAttached = true
+            stage(CarLifeProbeState.WIFI_TRANSPORT_ATTACHED)
         }
     }
 
@@ -347,6 +510,12 @@ class CarLifeV2Provider(
 
         override fun onTouchEvent(event: MotionEvent) =
             receiver.onTouchEvent(event)
+
+        override fun configureConnectTypeWithoutStarting(type: Int) =
+            receiver.configureConnectTypeWithoutStarting(type)
+
+        override fun setTransportProbeListener(listener: WirlessTransportProbe?) =
+            receiver.setTransportProbeListener(listener)
 
         override fun usbDeviceSummaries(): List<String> {
             // VID:PID only — never serial numbers or other identifying data.

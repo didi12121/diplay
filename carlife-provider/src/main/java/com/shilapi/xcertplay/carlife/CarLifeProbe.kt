@@ -49,6 +49,22 @@ enum class CarLifeProbeState {
     /** USB / AOA link detached. */
     DETACHED,
 
+    // ---- Wireless transport stages (Phase 9.2W-A; WIFI_AP / WIFI_DIRECT) ----
+    /** Wireless attempt armed; waiting for an IP network to carry discovery. */
+    WIFI_WAITING_NETWORK,
+
+    /** UDP discovery socket bound (port 7999) and listening. */
+    WIFI_UDP_LISTENING,
+
+    /** A discovery datagram arrived; the phone IP is now known. */
+    WIFI_PHONE_DISCOVERED,
+
+    /** TCP channel sockets to the phone are being opened. */
+    WIFI_TCP_CONNECTING,
+
+    /** TCP channel set attached; the protocol layer may now run. */
+    WIFI_TRANSPORT_ATTACHED,
+
     /** Unexpected transport or SDK failure. */
     ERROR,
 }
@@ -72,6 +88,16 @@ enum class CarLifeBlocker {
 
     /** Protocol accepted but channel verification / auth failed. */
     CHANNEL_OR_AUTH,
+
+    // ---- Wireless blockers (Phase 9.2W-A) ----
+    /** Wireless attempt had no usable local IP network at all. */
+    NO_NETWORK,
+
+    /** UDP listener ran but the phone never sent a discovery datagram. */
+    NO_DISCOVERY_PACKET,
+
+    /** Phone discovered (IP known) but the TCP channel set failed to attach. */
+    PHONE_DISCOVERED_TCP_FAILED,
 
     /** Anything else (transport crash, SDK exception...). */
     OTHER,
@@ -145,6 +171,30 @@ data class CarLifeProbeReport(
     val touchDropped: Int = 0,
     /** Last rejection reason / failure class name (diagnostic only). */
     val lastTouchError: String? = null,
+    // ---- Transport / wireless diagnostics (Phase 9.2W-A; no payloads) ----
+    /** CarLifeTransport of the current attempt: USB_AOA / WIFI_AP. */
+    val transport: String = "USB_AOA",
+    /** Local IPv4 seen on active interfaces (no SSID, no MAC). */
+    val localIp: String? = null,
+    /** Active network transport type: WIFI / ETHERNET / CELLULAR / OTHER. */
+    val networkType: String? = null,
+    /** UDP discovery port (7999, upstream constant) while listening. */
+    val udpPort: Int? = null,
+    val udpListening: Boolean = false,
+    /** Phone IP from the UDP discovery datagram source address. */
+    val phoneIp: String? = null,
+    val udpPacketsReceived: Int = 0,
+    /** TCP channel states (eager connect): cmd/video/audio/tts/vr/touch/update
+     *  -> "connecting" / "connected" / "failed". */
+    val tcpCmd: String? = null,
+    val tcpVideo: String? = null,
+    val tcpAudio: String? = null,
+    val tcpTts: String? = null,
+    val tcpVr: String? = null,
+    val tcpTouch: String? = null,
+    val tcpUpdate: String? = null,
+    /** True once the TCP channel set attached (protocol may now run). */
+    val transportAttached: Boolean = false,
 )
 
 /**
@@ -166,5 +216,15 @@ sealed class CarLifeConnectionEvent {
     data class Failed(
         override val session: CarLifeSessionToken,
         val message: String,
+    ) : CarLifeConnectionEvent()
+
+    /**
+     * Wireless transport probe stage (Phase 9.2W-A): diagnostic progression
+     * only (WIFI_UDP_LISTENING -> ... -> WIFI_TRANSPORT_ATTACHED); never the
+     * success criterion — CONNECTION_ESTABLISHED stays the only success.
+     */
+    data class WirelessStage(
+        override val session: CarLifeSessionToken,
+        val stage: CarLifeProbeState,
     ) : CarLifeConnectionEvent()
 }

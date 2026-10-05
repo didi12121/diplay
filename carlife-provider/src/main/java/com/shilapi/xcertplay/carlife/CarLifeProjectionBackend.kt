@@ -70,6 +70,13 @@ object SystemCarLifeProbeTimeoutScheduler : CarLifeProbeTimeoutScheduler {
  * RemoteControlManager performs the single surface → video mapping in the
  * SDK. Touch is session-scoped exactly like video — a stale touch from a dead
  * session is dropped with a `stale-touch-ignored` diagnostic.
+ *
+ * Phase 9.2W-A adds the SECOND transport (WIFI_AP / same LAN) WITHOUT a
+ * second backend: the transport is part of the connect REQUEST
+ * ([ProjectionDevice.transport]), scoped resources are USB+AUDIO (USB_AOA) or
+ * WIFI+AUDIO (WIFI_AP), and only one CarLife attempt may be active at a time.
+ * Protocol/version/auth, the video bridge, touch and session fencing are
+ * shared verbatim across transports. WIFI_DIRECT stays EXPERIMENTAL_DISABLED.
  */
 class CarLifeProjectionBackend(
     private val provider: CarLifeProvider,
@@ -101,6 +108,10 @@ class CarLifeProjectionBackend(
 
     @Volatile
     private var activeSession: CarLifeSessionToken? = null
+
+    /** Transport of the CURRENT attempt (Phase 9.2W-A). Never stale. */
+    @Volatile
+    private var activeTransport: CarLifeTransport = CarLifeTransport.USB_AOA
 
     @Volatile
     private var probeReport = CarLifeProbeReport()
@@ -134,7 +145,36 @@ class CarLifeProjectionBackend(
         get() = stateStore.state
 
     /** Latest protocol diagnostics (no user content, no secrets). */
-    fun probeReport(): CarLifeProbeReport = probeReport
+    fun probeReport(): CarLifeProbeReport {
+        // Fresh wireless/network values on every read (probe panel polls).
+        syncWirelessDiagnostics()
+        return probeReport
+    }
+
+    /**
+     * Copies real wireless/network diagnostics from the provider into the
+     * report (IPs and channel states only — no payloads, no SSID, no MAC).
+     */
+    private fun syncWirelessDiagnostics() {
+        val diag = runCatching { provider.diagnostics() }.getOrNull() ?: return
+        probeReport = probeReport.copy(
+            transport = diag.transport,
+            localIp = diag.localIp,
+            networkType = diag.networkType,
+            udpPort = diag.udpPort,
+            udpListening = diag.udpListening,
+            phoneIp = diag.phoneIp ?: probeReport.phoneIp,
+            udpPacketsReceived = diag.udpPacketsReceived,
+            tcpCmd = diag.tcpChannels["cmd"],
+            tcpVideo = diag.tcpChannels["video"],
+            tcpAudio = diag.tcpChannels["audio"],
+            tcpTts = diag.tcpChannels["tts"],
+            tcpVr = diag.tcpChannels["vr"],
+            tcpTouch = diag.tcpChannels["touch"],
+            tcpUpdate = diag.tcpChannels["update"],
+            transportAttached = diag.transportAttached,
+        )
+    }
 
     override fun addStateListener(listener: ProjectionStateListener) = stateStore.addListener(listener)
 
@@ -166,14 +206,48 @@ class CarLifeProjectionBackend(
         return requested
     }
 
+    /**
+     * Transport-scoped resources (Phase 9.2W-A): USB_AOA claims USB+AUDIO,
+     * WIFI_AP claims WIFI+AUDIO — never both, never BLUETOOTH for WIFI_AP.
+     * The transport is resolved from the connect REQUEST
+     * ([ProjectionDevice.transport]), never from a previous session.
+     */
+    override fun requiredResourcesFor(device: ProjectionDevice?): Set<ProjectionResource> =
+        CarLifeTransport.forDevice(device)?.resources()
+            // Unsupported request: connect() rejects it - claim nothing.
+            ?: emptySet()
+
     override fun connect(device: ProjectionDevice?) {
         if (!provider.isAvailable) {
             publishError(ProjectionErrorCode.PROVIDER_UNAVAILABLE, "CarLife provider unavailable")
             return
         }
-        if (isSessionActive || connectPending) return
+        if (isSessionActive || connectPending) {
+            // EXCLUSIVE TRANSPORT: only one CarLife attempt (USB or wireless)
+            // may be active. Starting the other transport while one is live is
+            // rejected - never run AOA and AP concurrently.
+            probeReport = probeReport.copy(lastError = "transport-busy:${activeTransport.name}")
+            return
+        }
+        // Deterministic transport resolution from the typed request field.
+        val transport = CarLifeTransport.forDevice(device)
+        if (transport == null) {
+            publishError(
+                ProjectionErrorCode.PROVIDER_UNAVAILABLE,
+                "CarLife has no transport for request ${device?.transport}",
+            )
+            return
+        }
+        if (!transport.isEnabled) {
+            publishError(
+                ProjectionErrorCode.PROVIDER_UNAVAILABLE,
+                "CarLife transport ${transport.name} is EXPERIMENTAL_DISABLED",
+            )
+            return
+        }
         val token = CarLifeSessionToken(sessionCounter.incrementAndGet())
         activeSession = token
+        activeTransport = transport
         connectPending = true
         videoFrameCount = 0
         videoConfigCount = 0
@@ -183,21 +257,38 @@ class CarLifeProjectionBackend(
         // previous one (reconnect cannot receive a previous session gesture).
         clearTouchGestureState()
         probeReport = CarLifeProbeReport(
-            state = CarLifeProbeState.USB_DEVICE_FOUND,
-            blocker = CarLifeBlocker.NO_REAL_DEVICE,
+            state = if (transport == CarLifeTransport.WIFI_AP) {
+                CarLifeProbeState.WIFI_WAITING_NETWORK
+            } else {
+                CarLifeProbeState.USB_DEVICE_FOUND
+            },
+            blocker = if (transport == CarLifeTransport.WIFI_AP) {
+                CarLifeBlocker.NO_DISCOVERY_PACKET
+            } else {
+                CarLifeBlocker.NO_REAL_DEVICE
+            },
             session = token.value,
             ptsSource = CarLifeVideoFraming.PTS_SOURCE,
+            transport = transport.name,
         )
         stateStore.publish(ProjectionState.Connecting)
         try {
-            provider.startConnection(token, ::onConnectionEvent)
+            provider.startConnection(token, transport, ::onConnectionEvent)
             provider.diagnostics().let { diag ->
                 probeReport = probeReport.copy(
                     usbDevice = diag.usbDevices.joinToString().ifEmpty { null },
                     protocolVersion = diag.localProtocolVersion,
+                    localIp = diag.localIp,
+                    networkType = diag.networkType,
                 )
             }
-            probeReport = probeReport.copy(state = CarLifeProbeState.AOA_SWITCH_REQUESTED)
+            probeReport = probeReport.copy(
+                state = if (transport == CarLifeTransport.WIFI_AP) {
+                    CarLifeProbeState.WIFI_WAITING_NETWORK
+                } else {
+                    CarLifeProbeState.AOA_SWITCH_REQUESTED
+                },
+            )
             armProbeTimeout(token)
         } catch (error: Exception) {
             connectPending = false
@@ -406,6 +497,12 @@ class CarLifeProjectionBackend(
                 }
                 probeReport = probeReport.copy(state = stage)
             }
+            is CarLifeConnectionEvent.WirelessStage -> {
+                // Wireless transport progression (diagnostic only). Success
+                // stays CONNECTION_ESTABLISHED; sync real wireless diagnostics.
+                probeReport = probeReport.copy(state = event.stage)
+                syncWirelessDiagnostics()
+            }
             is CarLifeConnectionEvent.Established -> {
                 if (isSessionActive) return
                 cancelProbeTimeout()
@@ -470,6 +567,14 @@ class CarLifeProjectionBackend(
         val token = activeSession
         connectPending = false
         isSessionActive = false
+        // TRANSPORT OWNERSHIP (Phase 9.2W-A): a wireless attempt owns network
+        // sockets (UDP 7999 + TCP channel set) whose lifecycle is
+        // session-scoped - they are torn down here so no socket/thread of this
+        // session can survive into the next one. The proven USB AOA path keeps
+        // exactly its Phase 9.1 lifecycle (unchanged, real-device verified).
+        if (token != null && activeTransport != CarLifeTransport.USB_AOA) {
+            runCatching { provider.stopConnection(token) }
+        }
         provider.detachVideo(token ?: CarLifeSessionToken(-1))
         closeVideoSink(token)
         // Session over: gesture state and the touch surface cache die with it.
@@ -609,17 +714,47 @@ class CarLifeProjectionBackend(
     /** Classification-only watchdog (never fabricates state or identity). */
     private fun armProbeTimeout(token: CarLifeSessionToken) {
         cancelProbeTimeout()
-        probeTimeout = timeoutScheduler.schedule(probeTimeoutMillis) {
+        // Wireless discovery needs longer than the AOA attach window.
+        val timeoutMillis = if (activeTransport == CarLifeTransport.WIFI_AP) {
+            WIRELESS_PROBE_TIMEOUT_MILLIS
+        } else {
+            probeTimeoutMillis
+        }
+        probeTimeout = timeoutScheduler.schedule(timeoutMillis) {
             if (activeSession != token) return@schedule
             if (isSessionActive) return@schedule
-            val usbSeen = probeReport.usbDevice != null
-            val blocker = if (usbSeen) CarLifeBlocker.AOA_COMPATIBILITY else CarLifeBlocker.NO_REAL_DEVICE
+            syncWirelessDiagnostics()
+            val blocker = classifyProbeTimeout()
             finishSession(
                 CarLifeProbeState.ERROR,
                 blocker = blocker,
                 errorCode = ProjectionErrorCode.TIMEOUT,
-                message = "CarLife probe timed out waiting for AOA attach",
+                message = if (activeTransport == CarLifeTransport.WIFI_AP) {
+                    "CarLife wireless probe timed out (${blocker.name})"
+                } else {
+                    "CarLife probe timed out waiting for AOA attach"
+                },
             )
+        }
+    }
+
+    /**
+     * Precise failure classification (never collapses into OTHER):
+     *  - wireless: NO_NETWORK / NO_DISCOVERY_PACKET /
+     *    PHONE_DISCOVERED_TCP_FAILED (audited: the connector eagerly opens all
+     *    TCP channels, so "phone discovered" + no attach == TCP failed)
+     *  - wired: AOA_COMPATIBILITY / NO_REAL_DEVICE (unchanged Phase 9.1)
+     */
+    private fun classifyProbeTimeout(): CarLifeBlocker = when (activeTransport) {
+        CarLifeTransport.WIFI_AP -> when {
+            probeReport.localIp == null -> CarLifeBlocker.NO_NETWORK
+            probeReport.phoneIp != null -> CarLifeBlocker.PHONE_DISCOVERED_TCP_FAILED
+            else -> CarLifeBlocker.NO_DISCOVERY_PACKET
+        }
+        else -> if (probeReport.usbDevice != null) {
+            CarLifeBlocker.AOA_COMPATIBILITY
+        } else {
+            CarLifeBlocker.NO_REAL_DEVICE
         }
     }
 
@@ -635,5 +770,8 @@ class CarLifeProjectionBackend(
     companion object {
         const val ID = "carlife"
         const val DEFAULT_PROBE_TIMEOUT_MILLIS = 15_000L
+
+        /** Wireless discovery needs longer than the AOA attach window. */
+        const val WIRELESS_PROBE_TIMEOUT_MILLIS = 90_000L
     }
 }

@@ -69,4 +69,26 @@ interface CarLifeReceiver: CarLifeContext {
      * P2P: CONNECTION_TYPE_WIFIDIRECT
      */
     fun setConnectType(type:Int)
+
+    /**
+     * DiPlay lifecycle extension (Phase 9.2W-A, host-local only): reconfigures
+     * the LOCAL transport family WITHOUT starting any network/USB work.
+     *
+     * Unlike [setConnectType] (which auto-connects via configConnectType +
+     * transport.connect()), this only:
+     *  - fully stops the previous transport (and suppresses detach
+     *    auto-reconnect),
+     *  - rebuilds the local transport implementation for [type],
+     *  - changes nothing on the wire (protocol/version/auth untouched).
+     * The caller starts the attempt later via [connect]. Only legal while no
+     * session is active; session fencing stays at the DiPlay provider
+     * boundary (CarLifeSessionToken).
+     */
+    fun configureConnectTypeWithoutStarting(type: Int) {}
+
+    /**
+     * DiPlay host-local extension (Phase 9.2W-A, diagnostics only): wireless
+     * transport progress probe. Never affects the protocol path.
+     */
+    fun setTransportProbeListener(listener: com.baidu.carlife.sdk.receiver.transport.wirless.WirlessTransportProbe?) {}
 }

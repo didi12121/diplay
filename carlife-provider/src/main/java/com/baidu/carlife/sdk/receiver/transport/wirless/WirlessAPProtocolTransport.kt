@@ -12,18 +12,25 @@ import java.net.SocketException
 
 class WirlessAPProtocolTransport(
     private val mCarLifeContext: CarLifeContext,
-    connectionListener: ConnectionListener?
+    connectionListener: ConnectionListener?,
+    // DiPlay host-local extension (Phase 9.2W-A): diagnostics-only probe.
+    private val probe: WirlessTransportProbe? = null,
 ) : ProtocolTransport(mCarLifeContext, connectionListener) {
     private var receiveBuf: ByteArray? = null
     private var mSocket: DatagramSocket? = null
     private var mPacket: DatagramPacket? = null
     private var mWIFIConnectThread: WifiConnectThread? = null
-    private val mWirlessConnector = WirlessConnector()
+    private val mWirlessConnector = WirlessConnector(probe)
+
+    // DiPlay host-local extension: discovery datagram counter (diagnostics).
+    private var udpPacketsReceived = 0
 
     companion object {
         private const val TAG = "WirlessTransport"
         private const val RECEIVE_BUFFER_SIZE = 1024
         private const val BOARDCAST_WIFI_PORT = 7999
+        /** DiPlay: exported for probe diagnostics/tests (upstream value). */
+        const val UDP_DISCOVERY_PORT = BOARDCAST_WIFI_PORT
     }
 
     override fun connect() {
@@ -32,6 +39,8 @@ class WirlessAPProtocolTransport(
             if (mSocket == null) {
                 mSocket = DatagramSocket(BOARDCAST_WIFI_PORT)
                 receiveBuf = ByteArray(RECEIVE_BUFFER_SIZE)
+                // DiPlay: real bind success -> WIFI_UDP_LISTENING.
+                probe?.onUdpListening(BOARDCAST_WIFI_PORT)
             }
             if (mWIFIConnectThread == null) {
                 mWIFIConnectThread = WifiConnectThread()
@@ -82,39 +91,57 @@ class WirlessAPProtocolTransport(
     private inner class WifiConnectThread : Thread() {
         private var isRunning = true
         override fun run() {
-            while (isRunning) {
-                try {
-                    mPacket = DatagramPacket(receiveBuf, receiveBuf!!.size)
-                    if (!isConnecting) {
-                        d(Constants.TAG, "start read broadcast socket")
-                        mSocket!!.receive(mPacket)
-                        d(Constants.TAG, "read broadcast socket")
-                        if (isRunning && null != mPacket && !isConnecting) {
-                            val serverIPAddress = mPacket!!.address
-                            d(
-                                Constants.TAG, "connect  packet:" +
-                                        serverIPAddress.hostAddress
-                            )
-                            if (mWirlessConnector!!.startConnect(serverIPAddress.hostAddress)) {
-                                d(Constants.TAG, "wifi onConnectionAttached")
-                                onConnectionAttached()
-                            }
-                        }
-                    } else {
-                        d(
-                            Constants.TAG, "is connected stop wifi :" +
-                                    mCarLifeContext.connectionType
-                        )
-                        stopConnect()
-                    }
-                } catch (e: Exception) {
-                    d(Constants.TAG, "UDPSocket IOException:", e)
+            try {
+                while (isRunning) {
                     try {
-                        sleep(1000)
-                    } catch (ignored: InterruptedException) {
+                        mPacket = DatagramPacket(receiveBuf, receiveBuf!!.size)
+                        if (!isConnecting) {
+                            d(Constants.TAG, "start read broadcast socket")
+                            mSocket!!.receive(mPacket)
+                            d(Constants.TAG, "read broadcast socket")
+                            if (isRunning && null != mPacket && !isConnecting) {
+                                val serverIPAddress = mPacket!!.address
+                                d(
+                                    Constants.TAG, "connect  packet:" +
+                                            serverIPAddress.hostAddress
+                                )
+                                // DiPlay host-local extension: discovery
+                                // diagnostics (phone IP + datagram count).
+                                udpPacketsReceived++
+                                val phoneIp = serverIPAddress.hostAddress ?: continue
+                                probe?.onUdpPacketReceived(phoneIp, udpPacketsReceived)
+                                probe?.onTcpConnecting(phoneIp)
+                                if (mWirlessConnector!!.startConnect(phoneIp)) {
+                                    d(Constants.TAG, "wifi onConnectionAttached")
+                                    probe?.onTransportAttached(phoneIp)
+                                    onConnectionAttached()
+                                }
+                            }
+                        } else {
+                            d(
+                                Constants.TAG, "is connected stop wifi :" +
+                                        mCarLifeContext.connectionType
+                            )
+                            stopConnect()
+                        }
+                    } catch (e: Exception) {
+                        d(Constants.TAG, "UDPSocket IOException:", e)
+                        // DiPlay fix (Phase 9.2W-A): never sleep AFTER the
+                        // stop request - terminate() must end this thread
+                        // deterministically (no zombie discovery thread into
+                        // the next session).
+                        try {
+                            if (isRunning) {
+                                sleep(1000)
+                            }
+                        } catch (ignored: InterruptedException) {
+                        }
+                        // onConnectionDetached();
                     }
-                    // onConnectionDetached();
                 }
+            } finally {
+                // DiPlay: deterministic lifecycle signal for probe/tests.
+                probe?.onUdpStopped()
             }
         }
 

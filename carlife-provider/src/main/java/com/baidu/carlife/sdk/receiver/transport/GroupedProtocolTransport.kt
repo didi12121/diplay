@@ -10,6 +10,7 @@ import com.baidu.carlife.sdk.internal.transport.TransportListener
 import com.baidu.carlife.sdk.receiver.transport.aoa.AOAProtocolTransport
 import com.baidu.carlife.sdk.receiver.transport.wirless.WirlessP2PProtocolTransport
 import com.baidu.carlife.sdk.receiver.transport.wirless.WirlessAPProtocolTransport
+import com.baidu.carlife.sdk.receiver.transport.wirless.WirlessTransportProbe
 
 class GroupedProtocolTransport(private val context: CarLifeContext) :
     ProtocolTransport.ConnectionListener, TransportListener {
@@ -25,6 +26,14 @@ class GroupedProtocolTransport(private val context: CarLifeContext) :
      */
     @Volatile
     private var reconnectSuppressed = false
+
+    /**
+     * DiPlay host-local extension (Phase 9.2W-A, diagnostics only): probe for
+     * wireless transport progress, handed to freshly built wirless transports.
+     * Never affects the protocol path.
+     */
+    @Volatile
+    var transportProbe: WirlessTransportProbe? = null
 
     init {
         // init transports
@@ -61,11 +70,19 @@ class GroupedProtocolTransport(private val context: CarLifeContext) :
         }
     }
 
+    /**
+     * Rebuilds the LOCAL transport implementation from
+     * FEATURE_CONFIG_CONNECT_TYPE. Stops every previous transport first
+     * ([stopConnect]) and NEVER starts a connection - the caller decides when
+     * to [connect]. This is the Phase 9.2W-A transport reconfiguration seam
+     * used by `CarLifeReceiverImpl.configureConnectTypeWithoutStarting`;
+     * wire protocol and auth are untouched.
+     */
     fun configConnectType() {
         stopConnect()
         when (context.getFeature(FEATURE_CONFIG_CONNECT_TYPE, CarLifeContext.CONNECTION_TYPE_AOA)) {
             CarLifeContext.CONNECTION_TYPE_HOTSPOT -> {
-                transports.add(WirlessAPProtocolTransport(context, this))
+                transports.add(WirlessAPProtocolTransport(context, this, transportProbe))
                 context.connectionType = CarLifeContext.CONNECTION_TYPE_HOTSPOT
             }
             CarLifeContext.CONNECTION_TYPE_WIFIDIRECT -> {

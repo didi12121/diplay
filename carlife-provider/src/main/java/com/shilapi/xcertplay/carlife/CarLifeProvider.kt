@@ -31,6 +31,23 @@ interface CarLifeProvider {
      */
     fun startConnection(token: CarLifeSessionToken, listener: (CarLifeConnectionEvent) -> Unit)
 
+    /**
+     * Begins one connection attempt under [token] over [transport]
+     * (Phase 9.2W-A). The transport is part of the connect REQUEST: resolved
+     * before resource acquisition and configured here WITHOUT starting
+     * network/USB work early (see
+     * [CarLifeReceiver.configureConnectTypeWithoutStarting]); the actual
+     * scan/listen/connect starts only inside this call.
+     *
+     * Default: legacy implementers are USB-only — delegate to the wired entry
+     * point.
+     */
+    fun startConnection(
+        token: CarLifeSessionToken,
+        transport: CarLifeTransport,
+        listener: (CarLifeConnectionEvent) -> Unit,
+    ) = startConnection(token, listener)
+
     /** Cancels/tears down the attempt of [token] (idempotent). */
     fun stopConnection(token: CarLifeSessionToken)
 
@@ -82,6 +99,25 @@ data class CarLifeProviderDiagnostics(
     val phoneCarlifeProtocolVersion: Int? = null,
     /** Raw SDK connection state (CarLifeContext constants 0..3). */
     val connectionState: Int = 0,
+    // ---- Transport / wireless diagnostics (Phase 9.2W-A) ----
+    /** CarLifeTransport name of the current attempt: USB_AOA / WIFI_AP. */
+    val transport: String = "USB_AOA",
+    /** Local IPv4 seen on active interfaces (no SSID, no MAC). */
+    val localIp: String? = null,
+    /** Active network transport type: WIFI / ETHERNET / CELLULAR / OTHER. */
+    val networkType: String? = null,
+    /** UDP discovery port (7999, upstream constant) while listening. */
+    val udpPort: Int? = null,
+    val udpListening: Boolean = false,
+    /** Phone IP taken from the UDP discovery datagram source address. */
+    val phoneIp: String? = null,
+    val udpPacketsReceived: Int = 0,
+    /** TCP channel states: "cmd"/"video"/"audio"/"tts"/"vr"/"touch"/"update"
+     *  -> "connecting" / "connected" / "failed". Eager connect (audited):
+     *  each channel opens its socket immediately. */
+    val tcpChannels: Map<String, String> = emptyMap(),
+    /** True once the TCP channel set attached (protocol may now run). */
+    val transportAttached: Boolean = false,
 )
 
 /**
