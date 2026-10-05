@@ -467,4 +467,26 @@
     <string name="center_map_no_permission_screen">Esta unidad principal no tiene pantalla de ajustes para este permiso. Permítelo por ADB.</string>
     <string name="launcher_map_sharing">Compartir el mapa en vivo con otros launchers</string>
     <string name="launcher_map_sharing_description">Los launchers compatibles con DiPlay pueden mostrar el mapa en vivo del panel de instrumentos en su propia pantalla de inicio. Desactivado por defecto, porque entonces cualquier aplicación de la unidad principal podría pedir el mapa. Consulta docs/LAUNCHER_INTEGRATION.md.</string>
+    <string name="phone_projection">Proyección del teléfono</string>
+    <string name="connection_method">Método de conexión</string>
+    <string name="method_auto">Automático</string>
+    <string name="method_carplay">Apple CarPlay</string>
+    <string name="method_carlink">Android CarLink</string>
+    <string name="carlink_framework">Marco CarLink (experimental)</string>
+    <string name="carlink_status_label">Estado</string>
+    <string name="carlink_status_disabled">No activado</string>
+    <string name="carlink_status_no_provider">Proveedor del protocolo CarLink no disponible</string>
+    <string name="carlink_status_discovering">Buscando dispositivos</string>
+    <string name="carlink_status_waiting">Esperando el dispositivo</string>
+    <string name="carlink_status_connecting">Conectando</string>
+    <string name="carlink_status_connected">Conectado</string>
+    <string name="carlink_status_error">Error</string>
+    <string name="carlink_supported">Destinos del marco: Xiaomi CarWith, vivo Jovi InCar, OPPO Car+ sobre ICCOA CarLink</string>
+    <string name="carlink_not_verified">CarLink experimental: la compatibilidad con teléfonos reales aún no está verificada</string>
+    <string name="carlink_discover">Buscar dispositivos</string>
+    <string name="carlink_connect">Conectar</string>
+    <string name="carlink_disconnect">Desconectar</string>
+    <string name="carlink_devices">Dispositivos</string>
+    <string name="carlink_resource_busy">Otra sesión de proyección está usando el hardware compartido. Desconéctala primero.</string>
+    <string name="carlink_status_disconnecting">Desconectando</string>
 </resources>

@@ -80,6 +80,15 @@ import com.shilapi.xcertplay.orchestration.ManualHotspotSecurity
 import com.shilapi.xcertplay.orchestration.MfiTarget
 import com.shilapi.xcertplay.orchestration.WirelessHotspotMode
 import com.shilapi.xcertplay.orchestration.isManualHotspotChannelCompatible
+import com.shilapi.xcertplay.projection.ProjectionDisplayGeometry
+import com.shilapi.xcertplay.projection.ProjectionHost
+import com.shilapi.xcertplay.projection.ProjectionLogger
+import com.shilapi.xcertplay.projection.ProjectionRect
+import com.shilapi.xcertplay.projection.ProjectionTakeoverListener
+import com.shilapi.xcertplay.projection.ProjectionTakeoverOutcome
+import com.shilapi.xcertplay.projection.ProjectionTouchEvents
+import com.shilapi.xcertplay.projection.ProjectionTransport
+import com.shilapi.xcertplay.projection.carplay.CarPlayProjectionBackend
 import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
 import com.shilapi.xcertplay.transport.Iap2LocationProvider
 import com.shilapi.xcertplay.transport.UsbDeviceId
@@ -3155,6 +3164,8 @@ class CarPlayHostActivity : ComponentActivity() {
     private fun createStatusReporter(
         controllerGeneration: Int,
     ): (CarPlayStatus) -> Unit = { status ->
+        // Mirror CarPlay status into the unified projection state machine.
+        ProjectionHost.carPlayBackend?.acceptStatus(status)
         if (!menuOpen && controllerGeneration == restartGeneration) {
             updateHotspotStatus(status)
             val description = status.describe()
@@ -3181,6 +3192,17 @@ class CarPlayHostActivity : ComponentActivity() {
         controller = snapshot.controller
         sink = snapshot.sink
         sessionDisplay = snapshot.display
+        // Re-wrap the adopted controller through the same registration path as
+        // a fresh start, so the host stop handler and resource lease survive the
+        // Activity hand-off (a takeover must be able to stop an adopted session).
+        registerWrappedCarPlayBackend(
+            snapshot.controller,
+            if (AirPlayPersistence.loadWirelessEnabled(this)) {
+                ProjectionTransport.WIFI
+            } else {
+                ProjectionTransport.USB
+            },
+        )
         MapMirrors.reapply()
         CarPlayBackgroundSession.store(snapshot.controller, snapshot.sink, snapshot.width, snapshot.height,
             this, snapshot.display) { completion ->
@@ -3293,6 +3315,66 @@ class CarPlayHostActivity : ComponentActivity() {
             },
         )
         controller = next
+        // Register the CarPlay backend with the projection host so UI and future
+        // backends (CarLink...) see one unified state machine. The controller is
+        // wrapped, not driven: CarPlay lifecycle stays exactly as before.
+        registerWrappedCarPlayBackend(
+            next,
+            if (config.transport == CarPlayTransport.WIRELESS) {
+                ProjectionTransport.WIFI
+            } else {
+                ProjectionTransport.USB
+            },
+        )
+        // USB CarPlay attach wins over an old CarLink session via the explicit
+        // takeover path. The controller is CREATED but must not be started (no
+        // USB attach / Wi-Fi bring-up / audio session) until the shared
+        // hardware is really claimed:
+        //
+        //   Activated   → start now
+        //   AwaitingStop→ wait for onTakeoverActivated (no polling, no sleep)
+        //   Blocked     → show the error, never start
+        val takeoverListener = object : ProjectionTakeoverListener {
+            override fun onTakeoverActivated(targetId: String) {
+                runOnUiThread { beginCarPlaySession(next, renderer, size, airPlayConfig) }
+            }
+
+            override fun onTakeoverFailed(targetId: String, message: String) {
+                runOnUiThread {
+                    appendLog("Projection takeover blocked: $message")
+                    setConnectionStage(
+                        getString(R.string.carlink_resource_busy),
+                    )
+                    shutdown(terminateProcess = false, reason = "projection takeover blocked")
+                }
+            }
+        }
+        when (
+            val outcome = runCatching {
+                ProjectionHost.manager.takeover(CarPlayProjectionBackend.ID, null, takeoverListener)
+            }.getOrNull()
+        ) {
+            is ProjectionTakeoverOutcome.AwaitingStop ->
+                appendLog("Projection takeover waiting for ${outcome.blockingBackendId} to stop")
+            null -> Log.w(TAG, "projection takeover failed to run")
+            // Activated fires the listener synchronously and the session is
+            // already starting; Blocked fired onTakeoverFailed.
+            else -> Unit
+        }
+    }
+
+    /**
+     * Starts the CarPlay session once the projection takeover really claimed
+     * the shared hardware. Runs exactly once per controller (the takeover
+     * listener fires exactly once).
+     */
+    private fun beginCarPlaySession(
+        next: CarPlayController,
+        renderer: AndroidMediaSink,
+        size: DisplaySize,
+        airPlayConfig: AirPlayConfig,
+    ) {
+        if (shuttingDown.get() || controller !== next || next.isClosed()) return
         CarPlayMediaKeys.attach(this, next)
         if (airPlayConfig.videoInCar) CarPlayVideo.attach(this, next)
         val display = CarPlaySessionDisplay(airPlayConfig.main.widthPixels, airPlayConfig.main.heightPixels,
@@ -3313,6 +3395,40 @@ class CarPlayHostActivity : ComponentActivity() {
             shutdown(false, "foreground service could not start")
             setConnectionStage(getString(R.string.could_not_start_carplay_return_to_diplay_and_check_app_per))
         }
+    }
+
+    /**
+     * Single registration path for a wrapped, externally-owned CarPlay
+     * controller (fresh start and background adopt alike): builds the backend,
+     * wires the host stop handler so a projection takeover can really stop the
+     * session, and registers it with the manager.
+     */
+    private fun registerWrappedCarPlayBackend(
+        next: CarPlayController,
+        transport: ProjectionTransport,
+    ): CarPlayProjectionBackend {
+        val backend = CarPlayProjectionBackend.wrapping(
+            controller = next,
+            logger = ProjectionLogger.ANDROID,
+            transport = transport,
+        )
+        // Host lifecycle hook: a projection-level takeover asks us to stop the
+        // externally-owned CarPlay session; run the real shutdown and then
+        // confirm the stop so the manager releases shared resources only after
+        // the controller has actually closed. Without this hook an adopted
+        // background session would answer "still stopping" forever.
+        backend.hostStopHandler = {
+            mainHandler.post {
+                shutdown(terminateProcess = false, reason = "projection takeover") {
+                    backend.notifySessionStopped()
+                }
+            }
+        }
+        ProjectionHost.manager.register(backend)
+        // Idempotent: keeps the hardware lease alive across an Activity adopt.
+        runCatching { ProjectionHost.manager.claim(CarPlayProjectionBackend.ID) }
+            .onFailure { Log.w(TAG, "projection resource claim failed: ${it.javaClass.simpleName}") }
+        return backend
     }
 
     private fun refreshConfiguration(newConfig: Configuration = resources.configuration) {
@@ -3578,6 +3694,10 @@ class CarPlayHostActivity : ComponentActivity() {
         val oldSink = sink
         CarPlayMediaKeys.detach(oldController)
         CarPlayBackgroundSession.clear(oldController)
+        // Selection/unregistration alone must NOT release shared hardware while
+        // the session is still running; the teardown below confirms the real
+        // stop and only then releases the projection backend's claims.
+        ProjectionHost.manager.unregister(CarPlayProjectionBackend.ID)
         controller = null
         sink = null
         sessionDisplay = null
@@ -3585,6 +3705,9 @@ class CarPlayHostActivity : ComponentActivity() {
         teardownExecutor.execute {
             oldController?.close()
             val clean = oldController?.awaitClosed(CONTROLLER_CLOSE_TIMEOUT_MILLIS) ?: true
+            // The CarPlay session is actually stopped now: release USB/Wi-Fi,
+            // audio and microphone claims so another backend may acquire them.
+            ProjectionHost.manager.onBackendSessionStopped(CarPlayProjectionBackend.ID)
             oldSink?.close()
             airPlayCommandExecutor.shutdown()
             if (terminateProcess) {
@@ -3667,8 +3790,20 @@ class CarPlayHostActivity : ComponentActivity() {
             }
             return true
         }
-        val contacts = CarPlayTouchMapper.contacts(event, content)
-        val queued = controller?.sendTouch(contacts) ?: false
+        // Unified input path: Android touch -> ProjectionTouchEvent -> active
+        // backend -> CarPlay HID. CarPlayInputAdapter applies the same
+        // normalization CarPlayTouchMapper used, so behavior is unchanged.
+        val geometry = ProjectionDisplayGeometry(
+            screenWidth = view.width,
+            screenHeight = view.height,
+            contentRect = ProjectionRect(content.left, content.top, content.width, content.height),
+        )
+        val backend = ProjectionHost.carPlayBackend
+        val queued = if (backend != null) {
+            backend.onTouchEvent(ProjectionTouchEvents.from(event, geometry))
+        } else {
+            controller?.sendTouch(CarPlayTouchMapper.contacts(event, content)) ?: false
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN,
             MotionEvent.ACTION_POINTER_DOWN,

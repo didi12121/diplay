@@ -1,0 +1,34 @@
+package com.baidu.carlife.protobuf;
+message CarlifeVehicleData
+{
+	// 信息类型
+    required int32 id = 1;
+
+    // 是否支持
+    optional bool support = 2;
+
+    // 区域ID，中控/车窗/车座等
+    optional int32 area_id = 3;
+
+    // 区域列表，前车窗/后车窗，主驾驶位座位/副驾驶座位等
+    repeated int32 area_value = 4;
+
+    // 信息值的类型
+    optional int32 value_type = 5;
+
+    // byte数组属性值
+    optional bytes bytes_value = 6;
+
+    // int32类型的属性值
+    repeated sint32 int32_values = 7;
+
+    // int64类型的属性值
+    repeated sint64 int64_values = 8;
+
+    // float类型的属性值
+    repeated float float_values = 9;
+
+    // string类型的属性值
+    optional string string_value = 10;
+
+}

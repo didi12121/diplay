@@ -1,0 +1,39 @@
+carlife-provider — third-party source attribution
+==================================================
+
+This module contains source code derived from:
+
+  Project:   Apollo-DuerOS (CarLife+ for Android Vehicle)
+  Repository: https://github.com/fgrcwp/apollo-DuerOS
+  Path:      CarLife-Android-Vehicle-V2.0/carlife-sdk/
+  License:   Apache License, Version 2.0 (see LICENSE in this directory)
+  Original implementation: Baidu (CarLife / CarLife+ vehicle-side SDK,
+  publicly open-sourced as "CarLife-Android-Vehicle" / "CarLife-Android-Vehicle-V2.0")
+
+Modifications made for DiPlay (Phase 9.1):
+  - Build files rewritten for the DiPlay toolchain (AGP 9.x, JDK 25,
+    compileSdk 37, protobuf-gradle-plugin + protobuf-javalite 3.25).
+    The legacy kotlin-android-extensions / kapt(ARouter) / old javalite
+    protoc plugin configuration was removed (unused by this source subset).
+  - AndroidManifest package attribute moved to the Gradle namespace.
+  - No protocol behavior was changed.
+
+Portions added by DiPlay (not from upstream) live under the
+`com.shilapi.xcertplay.carlife` package (probe state machine, projection
+backend skeleton, diagnostics) and are covered by the DiPlay repository
+license.
+
+SECURITY NOTE
+-------------
+The upstream repository also ships legacy signing material
+(`vehicle-app/carlife.keystore`, `vehicle-app/debug.keystore`). Those files
+are UNSAFE LEGACY CREDENTIALS and were deliberately NOT copied here and must
+never be copied into DiPlay. DiPlay uses its own debug/release signing.
+
+DEMO CHANNEL POLICY
+-------------------
+The upstream sample application passes demo channel / cuid values to
+`CarLife.init`. Any such value used by the DiPlay compatibility probe is a
+DEMO_CHANNEL — NOT FOR PRODUCTION — and CarLife compatibility with modern
+phones remains UNVERIFIED until a real-device probe reaches
+CONNECTION_ESTABLISHED.

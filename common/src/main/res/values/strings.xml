@@ -478,4 +478,26 @@
     <string name="center_map_no_permission_screen">This head unit has no settings screen for this permission. Allow it over ADB.</string>
     <string name="launcher_map_sharing">Share the live map with other launchers</string>
     <string name="launcher_map_sharing_description">Launchers that support DiPlay can show the live dashboard map inside their own home screen. Off by default, because any app on the head unit could then ask for the map. See docs/LAUNCHER_INTEGRATION.md.</string>
+    <string name="phone_projection">Phone Projection</string>
+    <string name="connection_method">Connection method</string>
+    <string name="method_auto">Auto</string>
+    <string name="method_carplay">Apple CarPlay</string>
+    <string name="method_carlink">Android CarLink</string>
+    <string name="carlink_framework">CarLink framework (experimental)</string>
+    <string name="carlink_status_label">Status</string>
+    <string name="carlink_status_disabled">Not enabled</string>
+    <string name="carlink_status_no_provider">CarLink protocol provider unavailable</string>
+    <string name="carlink_status_discovering">Discovering devices</string>
+    <string name="carlink_status_waiting">Waiting for device</string>
+    <string name="carlink_status_connecting">Connecting</string>
+    <string name="carlink_status_connected">Connected</string>
+    <string name="carlink_status_error">Error</string>
+    <string name="carlink_supported">Framework targets: Xiaomi CarWith, vivo Jovi InCar, OPPO Car+ over ICCOA CarLink</string>
+    <string name="carlink_not_verified">CarLink experimental — compatibility with real phones is not verified yet</string>
+    <string name="carlink_discover">Discover devices</string>
+    <string name="carlink_connect">Connect</string>
+    <string name="carlink_disconnect">Disconnect</string>
+    <string name="carlink_devices">Devices</string>
+    <string name="carlink_resource_busy">Another projection session is using shared hardware. Disconnect it first.</string>
+    <string name="carlink_status_disconnecting">Disconnecting</string>
 </resources>

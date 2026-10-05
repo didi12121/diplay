@@ -1,0 +1,6 @@
+package com.baidu.carlife.protobuf;
+message CarlifeWirlessInfo
+{
+    required int32 wirlessType = 1;
+    required int32 wifiFrequency = 2;
+}

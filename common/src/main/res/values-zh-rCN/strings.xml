@@ -478,4 +478,26 @@
     <string name="center_map_no_permission_screen">此车机没有该权限的设置界面，请通过 ADB 允许。</string>
     <string name="launcher_map_sharing">与其他启动器共享实时地图</string>
     <string name="launcher_map_sharing_description">支持 DiPlay 的启动器可以在自己的主屏幕中显示实时仪表盘地图。默认关闭，因为开启后车机上的任何应用都可以请求该地图。详见 docs/LAUNCHER_INTEGRATION.md。</string>
+    <string name="phone_projection">手机互联</string>
+    <string name="connection_method">连接方式</string>
+    <string name="method_auto">自动</string>
+    <string name="method_carplay">Apple CarPlay</string>
+    <string name="method_carlink">Android CarLink</string>
+    <string name="carlink_framework">CarLink 框架（实验性）</string>
+    <string name="carlink_status_label">状态</string>
+    <string name="carlink_status_disabled">未启用</string>
+    <string name="carlink_status_no_provider">CarLink 协议提供方不可用</string>
+    <string name="carlink_status_discovering">正在搜索设备</string>
+    <string name="carlink_status_waiting">等待设备</string>
+    <string name="carlink_status_connecting">正在连接</string>
+    <string name="carlink_status_connected">已连接</string>
+    <string name="carlink_status_error">错误</string>
+    <string name="carlink_supported">框架目标：小米 CarWith、vivo Jovi InCar、OPPO Car+（ICCOA CarLink）</string>
+    <string name="carlink_not_verified">CarLink 实验性功能——与真机的兼容性尚未验证</string>
+    <string name="carlink_discover">搜索设备</string>
+    <string name="carlink_connect">连接</string>
+    <string name="carlink_disconnect">断开</string>
+    <string name="carlink_devices">设备</string>
+    <string name="carlink_resource_busy">另一个投屏会话正在占用共享硬件，请先断开。</string>
+    <string name="carlink_status_disconnecting">正在断开</string>
 </resources>

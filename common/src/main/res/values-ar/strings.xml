@@ -467,4 +467,26 @@
     <string name="center_map_no_permission_screen">لا توجد في وحدة القيادة شاشة إعدادات لهذا الإذن. اسمح به عبر ADB.</string>
     <string name="launcher_map_sharing">مشاركة الخريطة المباشرة مع المشغّلات الأخرى</string>
     <string name="launcher_map_sharing_description">يمكن للمشغّلات التي تدعم DiPlay عرض خريطة لوحة العدادات المباشرة داخل شاشتها الرئيسية. معطّل افتراضيًا، لأن أي تطبيق على وحدة القيادة يمكنه عندها طلب الخريطة. راجع docs/LAUNCHER_INTEGRATION.md.</string>
+    <string name="phone_projection">عرض الهاتف</string>
+    <string name="connection_method">طريقة الاتصال</string>
+    <string name="method_auto">تلقائي</string>
+    <string name="method_carplay">Apple CarPlay</string>
+    <string name="method_carlink">Android CarLink</string>
+    <string name="carlink_framework">إطار CarLink (تجريبي)</string>
+    <string name="carlink_status_label">الحالة</string>
+    <string name="carlink_status_disabled">غير مفعّل</string>
+    <string name="carlink_status_no_provider">مزود بروتوكول CarLink غير متاح</string>
+    <string name="carlink_status_discovering">جارٍ البحث عن الأجهزة</string>
+    <string name="carlink_status_waiting">في انتظار الجهاز</string>
+    <string name="carlink_status_connecting">جارٍ الاتصال</string>
+    <string name="carlink_status_connected">متصل</string>
+    <string name="carlink_status_error">خطأ</string>
+    <string name="carlink_supported">أهداف الإطار: Xiaomi CarWith وvivo Jovi InCar وOPPO Car+ عبر ICCOA CarLink</string>
+    <string name="carlink_not_verified">CarLink تجريبي — التوافق مع الهواتف الحقيقية غير مُتحقَّق منه بعد</string>
+    <string name="carlink_discover">البحث عن الأجهزة</string>
+    <string name="carlink_connect">اتصال</string>
+    <string name="carlink_disconnect">قطع الاتصال</string>
+    <string name="carlink_devices">الأجهزة</string>
+    <string name="carlink_resource_busy">جلسة عرض أخرى تستخدم العتاد المشترك. اقطع اتصالها أولاً.</string>
+    <string name="carlink_status_disconnecting">جارٍ قطع الاتصال</string>
 </resources>

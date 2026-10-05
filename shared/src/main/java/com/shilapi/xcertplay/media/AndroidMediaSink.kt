@@ -136,7 +136,7 @@ class AndroidMediaSink(
     private val onAudioDiagnostic: (String) -> Unit = {},
     /** True while any music ("media") audio stream is running; called from media threads. */
     private val onMediaAudioChanged: (Boolean) -> Unit = {},
-) : MediaSink {
+) : MediaSink, AccessUnitMediaSink {
     private val appContext = context?.applicationContext
     private val audioManager = appContext?.getSystemService(AudioManager::class.java)
     private val audioFocusCoordinator = AudioFocusCoordinator(
@@ -195,6 +195,14 @@ class AndroidMediaSink(
 
     fun clearSurface(type: Int, surface: Surface) {
         if (surfaces.remove(type, surface)) videoDecoders[type]?.setSurface(null)
+    }
+
+    /**
+     * Detaches the output surface of [type] without needing the old Surface
+     * reference (used when the UI reports surfaceDestroyed).
+     */
+    fun clearSurface(type: Int) {
+        if (surfaces.remove(type) != null) videoDecoders[type]?.setSurface(null)
     }
 
     /**
@@ -378,9 +386,13 @@ class AndroidMediaSink(
     )
 
     @Synchronized
-    private fun audioRenderer(id: AudioStreamId, format: AudioFormat): AudioRenderer {
+    private fun audioRenderer(
+        id: AudioStreamId,
+        format: AudioFormat,
+        pcm: PcmEncoding = PcmEncoding.PCM_S16_BE,
+    ): AudioRenderer {
         val existing = audioRenderers[id]
-        if (existing?.format == format) return existing
+        if (existing?.format == format && existing.pcmEncoding == pcm) return existing
         existing?.close()
         return AudioRenderer(
             format,
@@ -392,7 +404,69 @@ class AndroidMediaSink(
             navigationStreamType,
             mediaBufferMillis,
             onAudioDiagnostic,
+            pcmEncoding = pcm,
         ).also { audioRenderers[id] = it }
+    }
+
+    // ------------------------------------------------------------------
+    // AccessUnitMediaSink: protocol-neutral rendering entry points.
+    // CarLink (and future protocols) drive these; CarPlay keeps using the
+    // MediaSink stream API above. Both share the same decoders and tracks.
+    // ------------------------------------------------------------------
+
+    override fun attachScreenSurface(streamId: Int, surface: Surface) {
+        setSurface(streamId, surface)
+    }
+
+    override fun detachScreenSurface(streamId: Int) {
+        clearSurface(streamId)
+    }
+
+    override fun setScreenStreamActive(streamId: Int, active: Boolean) {
+        onScreenStreamActive(streamId, active)
+    }
+
+    override fun configureVideoStream(
+        streamId: Int,
+        codec: VideoCodec,
+        codecData: ByteArray,
+        width: Int,
+        height: Int,
+    ) {
+        videoDecoder(streamId).configure(codec, codecData, width, height)
+    }
+
+    override fun submitVideoAccessUnit(
+        streamId: Int,
+        payload: ByteArray,
+        offset: Int,
+        length: Int,
+        presentationTimeUs: Long,
+    ) {
+        val window =
+            if (offset == 0 && length == payload.size) payload
+            else payload.copyOfRange(offset, offset + length)
+        videoDecoder(streamId).submit(window, presentationTimeUs)
+    }
+
+    override fun startAudioAccessUnitStream(
+        streamId: AudioStreamId,
+        format: AudioFormat,
+        pcm: PcmEncoding,
+        firstSample: Int,
+    ) {
+        audioRenderer(streamId, format, pcm).start()
+        if (format.audioType == "media") updateMediaAudio(streamId, true)
+    }
+
+    override fun submitAudioAccessUnit(streamId: AudioStreamId, unit: AudioAccessUnit) {
+        // Streams are opened via startAudioAccessUnitStream; frames without a
+        // known format cannot be rendered and are dropped loudly in the caller.
+        audioRenderers[streamId]?.submitUnit(unit)
+    }
+
+    override fun stopAudioAccessUnitStream(streamId: AudioStreamId) {
+        onAudioStopped(streamId)
     }
 }
 
@@ -421,13 +495,13 @@ private class VideoDecoder(
     private val stats = VideoStats(statsLabel ?: if (streamType == 110) "" else " stream=$streamType")
     private val thread = Thread(::run, "carplay-video").apply { isDaemon = true; start() }
 
-    fun configure(codec: VideoCodec, codecData: ByteArray) {
-        queue.offer(VideoJob.Config(codec, codecData))
+    fun configure(codec: VideoCodec, codecData: ByteArray, width: Int = 0, height: Int = 0) {
+        queue.offer(VideoJob.Config(codec, codecData, width, height))
     }
 
-    fun submit(nalus: ByteArray) {
+    fun submit(nalus: ByteArray, presentationTimeUs: Long = AudioAccessUnit.PTS_UNSPECIFIED) {
         stats.onReceived(nalus.size)
-        queue.offer(VideoJob.Frame(nalus))
+        queue.offer(VideoJob.Frame(nalus, presentationTimeUs = presentationTimeUs))
     }
 
     fun setSurface(surface: Surface?) {
@@ -450,7 +524,7 @@ private class VideoDecoder(
                             if (System.nanoTime() - job.receivedNs > MAX_FRAME_AGE_NS) {
                                 queue.discardFrames()
                                 recover("video backlog exceeded 250 ms")
-                            } else feed(job.nalus)
+                            } else feed(job.nalus, job.presentationTimeUs)
                         }
                         is VideoJob.SurfaceChanged -> changeSurface(job.surface)
                         is VideoJob.Resync -> recover("video queue overflow")
@@ -476,11 +550,7 @@ private class VideoDecoder(
 
     private fun configureDecoder(config: VideoJob.Config) {
         val previous = lastConfig
-        if (
-            decoder != null &&
-            previous?.codec == config.codec &&
-            previous.codecData.contentEquals(config.codecData)
-        ) {
+        if (decoder != null && config.sameDecoderSetupAs(previous)) {
             if (!duplicateConfigLogged) {
                 duplicateConfigLogged = true
                 Log.i(TAG, "video decoder config unchanged; keeping existing decoder")
@@ -494,6 +564,11 @@ private class VideoDecoder(
         val surface = outputSurface ?: return
         val codec = config.codec
         val codecData = config.codecData
+        // Real coded size from the protocol wins; sink defaults only fill in
+        // when the protocol did not report one (CarPlay negotiates the display
+        // size separately and passes 0 here).
+        val width = if (config.width > 0) config.width else this.width
+        val height = if (config.height > 0) config.height else this.height
         val mime = if (codec == VideoCodec.H265) MediaFormat.MIMETYPE_VIDEO_HEVC
         else MediaFormat.MIMETYPE_VIDEO_AVC
         val csd = if (codec == VideoCodec.H265) {
@@ -514,7 +589,7 @@ private class VideoDecoder(
         ) + softwareDecoderName(mime)?.let { listOf(DecoderAttempt(it, tuned = false)) }.orEmpty()
         var next: MediaCodec? = null
         for (attempt in attempts) {
-            next = tryConfigure(mime, csd, surface, attempt)
+            next = tryConfigure(mime, csd, surface, attempt, width, height)
             if (next != null) break
         }
         if (next == null) {
@@ -534,7 +609,13 @@ private class VideoDecoder(
 
     private data class DecoderAttempt(val codecName: String?, val tuned: Boolean)
 
-    private fun buildFormat(mime: String, csd: List<ByteArray>, tuned: Boolean): MediaFormat =
+    private fun buildFormat(
+        mime: String,
+        csd: List<ByteArray>,
+        tuned: Boolean,
+        width: Int,
+        height: Int,
+    ): MediaFormat =
         MediaFormat.createVideoFormat(mime, width, height).apply {
             if (tuned) {
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_SIZE)
@@ -548,10 +629,12 @@ private class VideoDecoder(
         csd: List<ByteArray>,
         surface: Surface,
         attempt: DecoderAttempt,
+        width: Int,
+        height: Int,
     ): MediaCodec? {
         var candidate: MediaCodec? = null
         return try {
-            val format = buildFormat(mime, csd, attempt.tuned)
+            val format = buildFormat(mime, csd, attempt.tuned, width, height)
             val codec = attempt.codecName?.let { MediaCodec.createByCodecName(it) } ?: createDecoder(mime)
             candidate = codec
             if (attempt.tuned && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
@@ -621,7 +704,7 @@ private class VideoDecoder(
         lastConfig?.let(::configureDecoder)
     }
 
-    private fun feed(nalus: ByteArray) {
+    private fun feed(nalus: ByteArray, presentationTimeUs: Long) {
         val annexB = MediaCodecSupport.toAnnexB(nalus)
         val config = lastConfig ?: return
         if (outputSurface == null) return
@@ -649,7 +732,10 @@ private class VideoDecoder(
         input.clear()
         if (annexB.size <= input.remaining()) {
             input.put(annexB)
-            codec.queueInputBuffer(index, 0, annexB.size, System.nanoTime() / 1000, 0)
+            // Real protocol PTS when provided; a monotonic clock only as the
+            // fallback for streams without timestamps (CarPlay).
+            val ptsUs = if (presentationTimeUs >= 0) presentationTimeUs else System.nanoTime() / 1000
+            codec.queueInputBuffer(index, 0, annexB.size, ptsUs, 0)
             referenceChain.onQueued()
         } else {
             recover("video frame exceeded codec input capacity")
@@ -756,7 +842,7 @@ private fun MediaFormat.intOrNull(key: String): Int? =
         }
     }
 
-/** Decodes AAC-LC/Opus to PCM and plays it, or plays wired LPCM directly. */
+/** Decodes AAC-LC/Opus to PCM and plays it, or plays raw PCM directly. */
 private class AudioRenderer(
     val format: AudioFormat,
     private val advancedAudioChannelMapping: Boolean,
@@ -767,12 +853,12 @@ private class AudioRenderer(
     private val navigationStreamType: Int,
     private val mediaBufferMillis: Int,
     private val report: (String) -> Unit,
+    /** Byte order of raw PCM16 streams (CarPlay wired LPCM is big-endian). */
+    val pcmEncoding: PcmEncoding = PcmEncoding.PCM_S16_BE,
 ) : Closeable {
-    private data class AudioPacket(val rtp: ByteArray, val sample: Int)
-
     private var trackAttributes: AudioAttributes? = null
     private var mappedChannel: AudioChannel? = null
-    private val queue = LinkedBlockingQueue<AudioPacket>(MAX_QUEUED_PACKETS)
+    private val queue = LinkedBlockingQueue<AudioAccessUnit>(MAX_QUEUED_PACKETS)
     @Volatile private var running = true
     @Volatile private var started = false
     private var codec: MediaCodec? = null
@@ -811,6 +897,36 @@ private class AudioRenderer(
     private var lastPcmWriteNs = 0L
     private var rebufferCount = 0
     private val thread = Thread(::run, "carplay-audio").apply { isDaemon = true }
+    /** Protocol-neutral codec dispatch; knows nothing about RTP. */
+    private val router = AudioAccessUnitRouter(
+        codec = format.codec,
+        sampleRate = format.sampleRate,
+        channels = format.channels,
+        pcmEncoding = pcmEncoding,
+        onPcm = ::writePcm,
+        onEncoded = { accessUnit, presentationTimeUs ->
+            if (!firstAacPayloadLogged && format.codec == AudioCodecKind.AAC_LC) {
+                firstAacPayloadLogged = true
+                Log.i(
+                    TAG,
+                    "audio AAC access unit bytes=${accessUnit.size} " +
+                        "head=${accessUnit.copyOf(minOf(accessUnit.size, 16)).toHexString()}",
+                )
+            }
+            // Real protocol PTS when present; clock only as the CarPlay-style
+            // fallback for streams without timestamps.
+            feedCodec(
+                accessUnit,
+                if (presentationTimeUs >= 0) presentationTimeUs else System.nanoTime() / 1000,
+            )
+        },
+        onDropped = { reason, bytes ->
+            if (!firstOpusShortPacketLogged) {
+                firstOpusShortPacketLogged = true
+                Log.i(TAG, "audio dropped unit reason=$reason bytes=$bytes")
+            }
+        },
+    )
 
     fun start() {
         if (started) return
@@ -818,14 +934,23 @@ private class AudioRenderer(
         thread.start()
     }
 
+    /**
+     * CarPlay path: one decrypted AirPlay RTP packet. RTP framing is stripped
+     * by [AirPlayAudioAdapter] exactly once, upstream of the shared renderer.
+     */
     fun submit(rtp: ByteArray, sample: Int) {
+        submitUnit(AirPlayAudioAdapter.accessUnit(rtp, sample, format.sampleRate))
+    }
+
+    /** Protocol-neutral path: one raw access unit (CarLink and friends). */
+    fun submitUnit(unit: AudioAccessUnit) {
         if (started) {
             packetsReceived.incrementAndGet()
             val now = System.nanoTime()
             val previous = lastArrivalNs.getAndSet(now)
             if (previous != 0L) maxArrivalGapMs.accumulateAndGet((now - previous) / 1_000_000L, ::maxOf)
         }
-        if (!started || !queue.offer(AudioPacket(rtp, sample))) {
+        if (!started || !queue.offer(unit)) {
             if (started) packetsDropped.incrementAndGet()
             if (started && !droppedPacketsLogged) {
                 droppedPacketsLogged = true
@@ -1112,48 +1237,14 @@ private class AudioRenderer(
             .putLong(OPUS_SEEK_PRE_ROLL_NANOS)
             .array()
 
-    private fun handle(packet: AudioPacket) {
-        val rtp = packet.rtp
-        val timestampUs = sampleTimestampUs(packet.sample)
-        when (format.codec) {
-            AudioCodecKind.LPCM -> writePcm(byteSwapS16(rtp.copyOfRange(12, rtp.size)))
-            AudioCodecKind.AAC_LC -> {
-                val accessUnit = rtp.copyOfRange(12, rtp.size)
-                if (accessUnit.isNotEmpty()) {
-                    if (!firstAacPayloadLogged) {
-                        firstAacPayloadLogged = true
-                        Log.i(
-                            TAG,
-                            "audio AAC access unit bytes=${accessUnit.size} " +
-                                "head=${accessUnit.copyOf(minOf(accessUnit.size, 16)).toHexString()}",
-                        )
-                    }
-                    feedCodec(
-                        MediaCodecSupport.adtsFrame(accessUnit, format.sampleRate, format.channels),
-                        timestampUs,
-                    )
-                }
-            }
-            AudioCodecKind.OPUS -> {
-                val accessUnit = rtp.copyOfRange(12, rtp.size)
-                if (accessUnit.size < MIN_OPUS_PACKET_BYTES) {
-                    if (!firstOpusShortPacketLogged) {
-                        firstOpusShortPacketLogged = true
-                        Log.i(
-                            TAG,
-                            "audio Opus skipping short packet bytes=${accessUnit.size} " +
-                                "head=${accessUnit.toHexString()}",
-                        )
-                    }
-                    return
-                }
-                feedCodec(accessUnit, timestampUs)
-            }
-        }
+    /**
+     * Shared codec dispatch: raw access units only. CarPlay RTP packets have
+     * already been adapted (header stripped, timestamp converted) by
+     * [AirPlayAudioAdapter]; CarLink raw frames arrive here unchanged.
+     */
+    private fun handle(unit: AudioAccessUnit) {
+        router.route(unit)
     }
-
-    private fun sampleTimestampUs(sample: Int): Long =
-        (sample.toLong() and 0xffff_ffffL) * 1_000_000L / format.sampleRate
 
     private fun feedCodec(payload: ByteArray, presentationTimeUs: Long) {
         val codec = codec ?: return
@@ -1356,15 +1447,6 @@ private class AudioRenderer(
             data[position] = scaled.toByte()
             data[position + 1] = (scaled shr 8).toByte()
         }
-    }
-
-    private fun byteSwapS16(source: ByteArray): ByteArray {
-        for (index in 0 until source.size - 1 step 2) {
-            val tmp = source[index]
-            source[index] = source[index + 1]
-            source[index + 1] = tmp
-        }
-        return source
     }
 
     @Synchronized

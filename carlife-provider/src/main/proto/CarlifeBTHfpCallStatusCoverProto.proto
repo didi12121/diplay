@@ -1,0 +1,7 @@
+package com.baidu.carlife.protobuf;
+message CarlifeBTHfpCallStatusCover
+{
+    required int32 state = 1;
+    required string phoneNum = 2;
+    required string name = 3;
+}

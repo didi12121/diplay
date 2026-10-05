@@ -33,11 +33,20 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.shilapi.xcertplay.airplay.CarPlayClusterDisplay
+import com.shilapi.xcertplay.carlink.CarLinkProjectionBackend
 import com.shilapi.xcertplay.hud.BydAdbAccess
 import com.shilapi.xcertplay.hud.BydNavigationOutputs
 import com.shilapi.xcertplay.hud.BydOutputSettings
 import com.shilapi.xcertplay.host.R
 import com.shilapi.xcertplay.orchestration.WirelessHotspotMode
+import com.shilapi.xcertplay.projection.ProjectionDevice
+import com.shilapi.xcertplay.projection.ProjectionErrorCode
+import com.shilapi.xcertplay.projection.ProjectionHost
+import com.shilapi.xcertplay.projection.ProjectionManager
+import com.shilapi.xcertplay.projection.ProjectionMode
+import com.shilapi.xcertplay.projection.ProjectionResourceConflictException
+import com.shilapi.xcertplay.projection.ProjectionState
+import com.shilapi.xcertplay.projection.ProjectionStateListener
 import com.shilapi.xcertplay.transport.EvChargingConnectors
 import java.io.File
 import java.text.SimpleDateFormat
@@ -58,6 +67,12 @@ class DiPlayActivity : ComponentActivity() {
     private var pendingWireless = false
     private var initialLaunch = true
     private var notificationTransport = true
+    // CarLink (Android projection) panel state.
+    private var carLinkStatus: TextView? = null
+    private var carLinkDevices: TextView? = null
+    private var carLinkDiscoverButton: Button? = null
+    private var carLinkConnectButton: Button? = null
+    private var carLinkDisconnectButton: Button? = null
     private var exportInProgress = false
     private var navigationStreamType = 14
     private var testToneTrack: AudioTrack? = null
@@ -69,7 +84,12 @@ class DiPlayActivity : ComponentActivity() {
         connect(notificationTransport)
     }
     private val tick = object : Runnable {
-        override fun run() { refreshStatus(); handler.postDelayed(this, 1000) }
+        override fun run() {
+            refreshStatus()
+            if (page == "carlink") refreshCarLinkPanel()
+            if (page == "carlife") refreshCarLifeProbe()
+            handler.postDelayed(this, 1000)
+        }
     }
     private val bluetoothPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) choosePhone() else permissionHelp(getString(R.string.nearby_devices), getString(R.string.allow_nearby_devices_so_diplay_can_connect_to_your_paired))
@@ -106,6 +126,14 @@ class DiPlayActivity : ComponentActivity() {
         }
         pendingCarHotspotSetup = savedInstanceState?.getBoolean("pending_car_hotspot") ?: false
         page = savedInstanceState?.getString("page") ?: intent.getStringExtra("page") ?: "home"
+        ProjectionHost.manager.select(
+            when (DiPlayPreferences.projectionMethod(this)) {
+                "carplay" -> ProjectionMode.CARPLAY
+                "carlink" -> ProjectionMode.CARLINK
+                else -> ProjectionMode.AUTO
+            },
+        )
+        ProjectionHost.manager.addStateListener(projectionSessionLauncher)
         render()
         handleWirelessRecovery()
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -159,6 +187,13 @@ class DiPlayActivity : ComponentActivity() {
     }
     override fun onPause() { handler.removeCallbacks(tick); super.onPause() }
 
+    override fun onDestroy() {
+        ProjectionHost.manager.removeStateListener(projectionSessionLauncher)
+        mockPattern?.close()
+        mockPattern = null
+        super.onDestroy()
+    }
+
     private fun render() {
         status = null; connectButton = null; disconnectButton = null; lastRunning = null
         val scroll = ScrollView(this).apply { setBackgroundColor(BG); isFillViewport = true; clipToPadding = false }
@@ -177,6 +212,8 @@ class DiPlayActivity : ComponentActivity() {
             "connection" -> connectionSetup(content)
             "settings" -> settings(content)
             "about" -> about(content)
+            "carlink" -> carlinkPanel(content)
+            "carlife" -> carLifePanel(content)
             else -> home(content)
         }
         setContentView(scroll)
@@ -227,6 +264,9 @@ class DiPlayActivity : ComponentActivity() {
         }
         right.addView(button(getString(R.string.connect_with_usb), false) { connect(false) }, matchButton())
         right.addView(label(getString(R.string.plug_your_iphone_into_a_usb_data_port_allow_carplay_when_y), 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(24)) })
+        right.addView(button(getString(R.string.phone_projection), false) { page = "carlink"; render() }, matchButton())
+        right.addView(button("CarLife (USB probe)", false) { page = "carlife"; render() }, matchButton())
+        right.addView(label(getString(R.string.carlink_framework), 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(24)) })
         right.addView(button(getString(R.string.settings), false) { page = "settings"; render() }, matchButton())
         right.addView(label(getString(R.string.make_diplay_feel_right_for_your_car), 14, MUTED).apply { gravity = Gravity.CENTER; setPadding(0, dp(10), 0, dp(24)) })
         right.addView(label("${getString(R.string.home_public_preview)}${version()}", 12, MUTED).apply { letterSpacing = .08f })
@@ -556,6 +596,376 @@ class DiPlayActivity : ComponentActivity() {
         section(content, getString(R.string.prefer_a_cable)) { card ->
             card.addView(label(getString(R.string.use_a_usb_data_cable_and_the_car_s_usb_data_port_unlock_yo), 16, MUTED))
             card.addView(button(getString(R.string.connect_with_usb), false) { connect(false) }, matchButton(12, 60))
+        }
+    }
+
+    /**
+     * Phone Projection page: connection method plus the Android CarLink panel.
+     *
+     * CarLink is an experimental framework: no official ICCOA CarLink SDK is
+     * integrated yet, so the panel drives a Mock protocol adapter and shows the
+     * real provider state instead of pretending a phone is connected.
+     */
+    // ---- Android CarLife (USB AOA) Compatibility Probe (Phase 9.1) ----
+
+    private var carLifeProvider: com.shilapi.xcertplay.carlife.CarLifeV2Provider? = null
+    private var carLifeBackendRef: com.shilapi.xcertplay.carlife.CarLifeProjectionBackend? = null
+    private var carLifeSessionLaunched = false
+    private var carLifeProbeStatus: TextView? = null
+    private var carLifeBtTargetName: String? = null
+    private var carLifeBtStartPending = false
+
+    /** Android 12+ BLUETOOTH_CONNECT runtime request (section 8). */
+    private val requestBtPermission = 7401
+
+    private fun carLifePanel(content: LinearLayout) {
+        section(content, "Android CarLife — USB / Wireless AP / Bluetooth Hotspot") { card ->
+            if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0) {
+                // Release builds never expose the developer probe.
+                card.addView(TextView(this).apply { this.text = "CarLife probe is available in debug builds only." })
+                return@section
+            }
+            val status = TextView(this).apply {
+                setTextColor(0xFFDDDDDD.toInt())
+                textSize = 13f
+                setPadding(dp(6), dp(8), dp(6), dp(8))
+            }
+            carLifeProbeStatus = status
+            card.addView(status, matchButton(4, -2))
+            card.addView(button("Developer: CarLife USB Probe — start", false) {
+                startCarLifeProbe(com.shilapi.xcertplay.projection.ProjectionTransport.USB)
+            }, matchButton(10, 60))
+            card.addView(button("Developer: CarLife Wireless — Legacy AP — start", false) {
+                startCarLifeProbe(com.shilapi.xcertplay.projection.ProjectionTransport.WIFI)
+            }, matchButton(10, 60))
+            card.addView(button("Developer: select Bluetooth target (names only)", false) {
+                pickCarLifeBtTarget()
+            }, matchButton(10, 60))
+            card.addView(button("Developer: CarLife Modern Wireless — Bluetooth + Phone Hotspot", false) {
+                startCarLifeProbe(com.shilapi.xcertplay.projection.ProjectionTransport.BLUETOOTH)
+            }, matchButton(10, 60))
+            card.addView(button("Developer: CarLife probe — disconnect", false) {
+                ProjectionHost.manager.disconnectBackend(com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID)
+                refreshCarLifeProbe()
+            }, matchButton(6, 60))
+            refreshCarLifeProbe()
+        }
+    }
+
+    /**
+     * Debug picker of BONDED Bluetooth device NAMES (section 11: never a MAC
+     * address / address / serial). The selected name is bound to the next
+     * modern-wireless attempt as its exact RFCOMM target.
+     */
+    private fun pickCarLifeBtTarget() {
+        try {
+            val provider = carLifeProvider ?: com.shilapi.xcertplay.carlife.CarLifeV2Provider().also {
+                it.initialize(
+                    applicationContext,
+                    com.shilapi.xcertplay.carlife.CarLifeProviderConfig(activityClass = DiPlayActivity::class.java),
+                )
+                carLifeProvider = it
+            }
+            val names = provider.listBondedBluetoothNames()
+            if (names.isEmpty()) {
+                toast("No bonded Bluetooth devices")
+                return
+            }
+            AlertDialog.Builder(this)
+                .setTitle("CarLife Bluetooth target (names only)")
+                .setItems(names.toTypedArray()) { _, which ->
+                    carLifeBtTargetName = names[which]
+                    refreshCarLifeProbe()
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        } catch (error: Exception) {
+            toast("Bluetooth list failed: ${error.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * Debug-only probe: initializes the open CarLife V2 provider with the
+     * PUBLIC demo configuration (DEMO_CHANNEL — NOT FOR PRODUCTION —
+     * COMPATIBILITY UNVERIFIED) and starts one connect attempt over the
+     * requested transport (USB AOA, legacy Wireless AP, or modern Bluetooth +
+     * phone hotspot). Only one CarLife attempt may be active at a time - the
+     * backend rejects mixed transports.
+     */
+    private fun startCarLifeProbe(transport: com.shilapi.xcertplay.projection.ProjectionTransport) {
+        try {
+            if (transport == com.shilapi.xcertplay.projection.ProjectionTransport.BLUETOOTH) {
+                // Section 8/32: explicit runtime permission flow on Android 12+.
+                if (com.shilapi.xcertplay.carlife.CarLifeBluetoothPermissions.needsRuntimeGrant(Build.VERSION.SDK_INT) &&
+                    checkSelfPermission("android.permission.BLUETOOTH_CONNECT") !=
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    carLifeBtStartPending = true
+                    requestPermissions(arrayOf("android.permission.BLUETOOTH_CONNECT"), requestBtPermission)
+                    return
+                }
+                if (carLifeBtTargetName.isNullOrEmpty()) {
+                    toast("Select a Bluetooth target first")
+                    return
+                }
+            }
+            // ONE provider / ONE CarLife.init / ONE backend registration per
+            // process. Start Probe reuses them — never new/re-init.
+            val provider = carLifeProvider ?: com.shilapi.xcertplay.carlife.CarLifeV2Provider().also {
+                it.initialize(
+                    applicationContext,
+                    com.shilapi.xcertplay.carlife.CarLifeProviderConfig(
+                        activityClass = DiPlayActivity::class.java,
+                    ),
+                )
+                carLifeProvider = it
+            }
+            val backend = carLifeBackendRef ?: com.shilapi.xcertplay.carlife.CarLifeProjectionBackend(
+                provider,
+                videoSinkProvider = AndroidCarLifeVideoSinkProvider(ProjectionHost.display, applicationContext),
+            ).also {
+                carLifeBackendRef = it
+                ProjectionHost.manager.register(it)
+            }
+            val deviceName = when (transport) {
+                com.shilapi.xcertplay.projection.ProjectionTransport.BLUETOOTH -> carLifeBtTargetName!!
+                com.shilapi.xcertplay.projection.ProjectionTransport.USB -> "Android phone (CarLife USB)"
+                else -> "Android phone (CarLife Wireless AP)"
+            }
+            ProjectionHost.manager.connect(
+                com.shilapi.xcertplay.projection.ProjectionDevice(
+                    id = "carlife-phone",
+                    // For BT_HOTSPOT this NAME is the deterministic RFCOMM
+                    // target (exact bonded-device match) - bound to the attempt.
+                    name = deviceName,
+                    backendId = com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID,
+                    transport = transport,
+                ),
+            )
+        } catch (conflict: com.shilapi.xcertplay.projection.ProjectionResourceConflictException) {
+            toast(getString(R.string.carlink_resource_busy))
+        } catch (error: Exception) {
+            toast("CarLife probe failed: ${error.javaClass.simpleName}")
+        }
+        refreshCarLifeProbe()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == requestBtPermission && carLifeBtStartPending) {
+            carLifeBtStartPending = false
+            if (grantResults.isNotEmpty() &&
+                grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                startCarLifeProbe(com.shilapi.xcertplay.projection.ProjectionTransport.BLUETOOTH)
+            } else {
+                toast("BLUETOOTH_CONNECT denied — modern wireless unavailable")
+                refreshCarLifeProbe()
+            }
+        }
+    }
+
+    /** Renders protocol diagnostics only — never user content or secrets. */
+    private fun refreshCarLifeProbe() {
+        val status = carLifeProbeStatus ?: return
+        val backend = carLifeBackendRef ?: run {
+            status.text = "probe idle — press start"
+            return
+        }
+        val report = backend.probeReport()
+        val held = ProjectionHost.manager.resourcesHeldBy(com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID)
+        status.text = buildString {
+            appendLine("state: ${report.state}  blocker: ${report.blocker}")
+            appendLine("transport: ${report.transport}  local: ${report.localIp ?: "-"}  network: ${report.networkType ?: "-"}")
+            appendLine("USB: ${report.usbDevice ?: "-"}   AOA: ${report.aoaState}")
+            appendLine("wireless: udp=${report.udpPort ?: "-"} listening=${report.udpListening} packets=${report.udpPacketsReceived} phone=${report.phoneIp ?: "-"}")
+            appendLine("tcp: cmd=${report.tcpCmd ?: "-"} video=${report.tcpVideo ?: "-"} audio=${report.tcpAudio ?: "-"} tts=${report.tcpTts ?: "-"} vr=${report.tcpVr ?: "-"} touch=${report.tcpTouch ?: "-"} update=${report.tcpUpdate ?: "-"} attached=${report.transportAttached}")
+            appendLine("Bluetooth: permission=${if (report.btPermission) "yes" else "no"} target=${report.btTarget ?: "-"} bonded=${report.btBonded ?: "-"} rfcomm=${report.btRfcomm}")
+            appendLine("bootstrap: infoRequest=${report.btInfoRequest} infoResponse=${report.btInfoResponse} advertisedType=${report.btAdvertisedType ?: "-"} targetInfoRequest=${report.btTargetInfoRequest} requestIpSent=${report.btRequestIpSent} responseIpReceived=${report.btResponseIpReceived} path=${report.modernWirelessPath ?: "-"}")
+            appendLine("connection: ${report.connectionState}  protocolVersion: ${report.protocolVersion ?: "-"}")
+            appendLine("phone CarLife protocol version: ${report.phoneCarlifeProtocolVersion ?: "0 (not reported)"}   auth: ${report.authResult ?: "-"}")
+            appendLine("last error: ${report.lastError ?: "-"}")
+            appendLine("held resources: ${if (held.isEmpty()) "-" else held.joinToString(", ")}")
+            appendLine("video: ${report.videoCodec ?: "-"} ${report.videoWidth ?: "-"}x${report.videoHeight ?: "-"}  stage: ${report.videoStage}")
+            appendLine("video stats: cfg=${report.videoConfigCount} frames=${report.videoFrameCount} bytes=${report.videoBytes} keyframes=${report.keyframeCount}")
+            appendLine("video handshake: initSent=${report.videoInitSent} initDone=${report.videoInitDoneReceived} startSent=${report.videoStartSent} dataSeen=${report.videoDataSeen}")
+            appendLine("pts: ${report.ptsSource}  decoder: ${report.decoderState}  firstFrame: ${report.firstFrameRendered}")
+            appendLine("video error: ${report.lastVideoError ?: "-"}  phone CarLife protocol: ${report.phoneCarlifeProtocolVersion ?: "0 (not reported)"}")
+            appendLine("touch: ${report.touchState} sent=${report.touchEventsSent} down=${report.touchDownCount} move=${report.touchMoveCount} up=${report.touchUpCount} cancel=${report.touchCancelCount} dropped=${report.touchDropped}")
+            appendLine("touch last: ${report.lastTouchAction ?: "-"} @ ${report.lastTouchX ?: "-"},${report.lastTouchY ?: "-"}  surface: ${report.touchSurfaceWidth ?: "-"}x${report.touchSurfaceHeight ?: "-"}  error: ${report.lastTouchError ?: "-"}")
+            append("DEMO_CHANNEL — NOT FOR PRODUCTION — COMPATIBILITY UNVERIFIED")
+        }
+        // First real video config -> open the shared projection page
+        // (SurfaceView + shared AndroidMediaSink rendering path).
+        if (!carLifeSessionLaunched && report.videoConfigCount > 0) {
+            carLifeSessionLaunched = true
+            startActivity(ProjectionSessionActivity.createIntent(this, com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID))
+        }
+    }
+    private fun carlinkPanel(content: LinearLayout) {
+        content.addView(label(getString(R.string.phone_projection), 34, TEXT, true))
+        content.addView(label(getString(R.string.carlink_not_verified), 17, MUTED).apply { setPadding(0, dp(8), 0, dp(24)) })
+
+        section(content, getString(R.string.connection_method)) { card ->
+            val methods = listOf(
+                ProjectionMode.AUTO to getString(R.string.method_auto),
+                ProjectionMode.CARPLAY to getString(R.string.method_carplay),
+                ProjectionMode.CARLINK to getString(R.string.method_carlink),
+            )
+            val current = methods.indexOfFirst { it.first.name == DiPlayPreferences.projectionMethod(this) }
+                .coerceAtLeast(0)
+            choice(card, getString(R.string.connection_method), methods.map { it.second }, current, reconnects = false) { index ->
+                DiPlayPreferences.saveProjectionMethod(this, methods[index].first.name.lowercase())
+                ProjectionHost.manager.select(methods[index].first)
+            }
+        }
+
+        val backend = ProjectionHost.registerCarLink(context = applicationContext)
+        section(content, getString(R.string.carlink_framework)) { card ->
+            carLinkStatus = label("", 20, TEXT, true).apply { setPadding(0, dp(4), 0, dp(12)) }
+            card.addView(carLinkStatus)
+            card.addView(label(getString(R.string.carlink_supported), 15, MUTED).apply { setPadding(0, 0, 0, dp(8)) })
+            carLinkDevices = label("", 15, MUTED).apply { setPadding(0, 0, 0, dp(8)) }
+            card.addView(carLinkDevices)
+            carLinkDiscoverButton = button(getString(R.string.carlink_discover), true) {
+                backend.initialize()
+                backend.start()
+                refreshCarLinkPanel()
+            }
+            card.addView(carLinkDiscoverButton, matchButton(8, 60))
+            carLinkConnectButton = button(getString(R.string.carlink_connect), false) {
+                try {
+                    ProjectionHost.manager.select(ProjectionMode.CARLINK)
+                    ProjectionHost.manager.connect(null)
+                } catch (conflict: ProjectionResourceConflictException) {
+                    toast(getString(R.string.carlink_resource_busy))
+                } catch (error: Exception) {
+                    toast("${getString(R.string.carlink_status_error)}: ${error.message ?: error.javaClass.simpleName}")
+                }
+                refreshCarLinkPanel()
+            }
+            card.addView(carLinkConnectButton, matchButton(10, 60))
+            carLinkDisconnectButton = button(getString(R.string.carlink_disconnect), false) {
+                ProjectionHost.manager.disconnect()
+                refreshCarLinkPanel()
+            }
+            card.addView(carLinkDisconnectButton, matchButton(10, 60))
+            // No protocol provider (no official SDK): nothing to discover or
+            // connect — say so honestly instead of offering dead buttons.
+            val available = backend.carLink.available
+            carLinkDiscoverButton?.isEnabled = available
+            carLinkConnectButton?.isEnabled = available
+            carLinkDisconnectButton?.isEnabled = available
+            // Developer-only mock entry (debug builds): drives the real
+            // rendering pipeline with a generated H.264 test pattern and a PCM
+            // tone so a developer can verify Surface/MediaCodec/AudioTrack end
+            // to end. Never present in a release APK.
+            if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+                card.addView(button("Developer: mock USB session (test pattern + tone)", false) {
+                    startMockCarLinkSession(transport = com.shilapi.xcertplay.projection.ProjectionTransport.USB)
+                }, matchButton(10, 60))
+                card.addView(button("Developer: mock Wi-Fi session (test pattern + tone)", false) {
+                    startMockCarLinkSession(transport = com.shilapi.xcertplay.projection.ProjectionTransport.WIFI)
+                }, matchButton(10, 60))
+            }
+        }
+        refreshCarLinkPanel()
+    }
+
+    /**
+     * Debug-only harness: registers the mock protocol adapter and streams a
+     * real H.264 test pattern + PCM tone through the shared media pipeline.
+     */
+    private var mockPattern: com.shilapi.xcertplay.carlink.MockCarLinkTestPattern? = null
+
+    /** Auto-enter the projection host page when a CarLink session connects. */
+    private val projectionSessionLauncher = ProjectionStateListener { backendId, state ->
+        if (backendId == CarLinkProjectionBackend.ID && state == ProjectionState.Connected) {
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) {
+                    // Bind the page to the CarLink backend explicitly — the
+                    // page never follows a drifting "active backend".
+                    startActivity(
+                        ProjectionSessionActivity.createIntent(this, CarLinkProjectionBackend.ID),
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Debug-only harness: registers the mock protocol adapter with a device of
+     * the chosen [transport] and streams a real H.264 test pattern + PCM tone
+     * through the shared media pipeline. Verifies that USB mock claims
+     * USB+AUDIO and Wi-Fi mock claims WIFI+AUDIO.
+     */
+    private fun startMockCarLinkSession(
+        transport: com.shilapi.xcertplay.projection.ProjectionTransport,
+    ) {
+        val adapter = com.shilapi.xcertplay.carlink.MockCarLinkProtocolAdapter()
+        val backend = ProjectionHost.registerCarLinkMock(
+            mediaSinks = com.shilapi.xcertplay.carlink.AndroidCarLinkMediaSinkProvider(
+                ProjectionHost.display,
+                applicationContext,
+            ),
+            adapter = adapter,
+        )
+        backend.initialize()
+        backend.start()
+        // Pick the discovered phone matching the requested transport so the
+        // harness proves both resource paths (USB+AUDIO vs WIFI+AUDIO).
+        val device = backend.discoveredDevices().firstOrNull { it.transport == transport }
+            ?: backend.discoveredDevices().firstOrNull()
+        ProjectionHost.manager.select(ProjectionMode.CARLINK)
+        if (device != null) {
+            try {
+                ProjectionHost.manager.connect(device)
+            } catch (conflict: ProjectionResourceConflictException) {
+                toast(getString(R.string.carlink_resource_busy))
+                return
+            }
+        }
+        mockPattern?.close()
+        mockPattern = com.shilapi.xcertplay.carlink.MockCarLinkTestPattern(adapter).also { it.start() }
+        val held = ProjectionHost.manager.resourcesHeldBy(CarLinkProjectionBackend.ID)
+        toast("Mock session up — held resources: ${held.joinToString(", ")}")
+        refreshCarLinkPanel()
+    }
+
+    /** Renders the CarLink backend state and discovered devices into the panel. */
+    private fun refreshCarLinkPanel() {
+        val backend = ProjectionHost.carLinkBackend ?: return
+        val state = backend.state
+        val providerAvailable = backend.carLink.available
+        val statusText = when {
+            !providerAvailable -> getString(R.string.carlink_status_no_provider)
+            state is ProjectionState.Error ->
+                if (state.code == ProjectionErrorCode.PROVIDER_UNAVAILABLE) {
+                    getString(R.string.carlink_status_no_provider)
+                } else {
+                    "${getString(R.string.carlink_status_error)}: ${state.message}"
+                }
+            state == ProjectionState.Idle -> getString(R.string.carlink_status_disabled)
+            state == ProjectionState.Initializing || state == ProjectionState.Ready ->
+                getString(R.string.carlink_status_waiting)
+            state == ProjectionState.Discovering -> getString(R.string.carlink_status_discovering)
+            state == ProjectionState.Connecting -> getString(R.string.carlink_status_connecting)
+            state == ProjectionState.Connected -> getString(R.string.carlink_status_connected)
+            state == ProjectionState.Disconnecting -> getString(R.string.carlink_status_disconnecting)
+            else -> getString(R.string.carlink_status_disabled)
+        }
+        carLinkStatus?.text = "${getString(R.string.carlink_status_label)}: $statusText"
+        val devices = backend.discoveredDevices()
+        carLinkDevices?.text = when {
+            !providerAvailable -> getString(R.string.carlink_status_no_provider)
+            devices.isEmpty() -> getString(R.string.carlink_status_waiting)
+            else -> devices.joinToString("\n") { device: ProjectionDevice ->
+                "${device.name}${device.vendorHint?.let { " · $it" } ?: ""}"
+            }
         }
     }
 

@@ -1,0 +1,5 @@
+package com.baidu.carlife.protobuf;
+message CarlifeBTAudioInfo
+{
+    required int32 supportBtAudio = 1;
+}

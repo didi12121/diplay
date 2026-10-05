@@ -1,0 +1,10 @@
+package com.baidu.carlife.protobuf;
+import "CarlifeFeatureConfigProto.proto"; 
+message CarlifeFeatureConfigList
+{
+        required int32  cnt = 1;
+        repeated com.baidu.carlife.protobuf.CarlifeFeatureConfig featureConfig = 2;
+        optional bool huBtAudioSupport = 3;
+        optional string huBtName = 4;
+        optional string huBtMAC = 5;
+}

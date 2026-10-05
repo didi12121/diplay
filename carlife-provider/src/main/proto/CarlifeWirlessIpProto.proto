@@ -1,0 +1,5 @@
+package com.baidu.carlife.protobuf;
+message CarlifeWirlessIp
+{
+    required string wirlessip = 1;
+}

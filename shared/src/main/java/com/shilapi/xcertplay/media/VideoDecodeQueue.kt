@@ -6,8 +6,34 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 internal sealed interface VideoJob {
-    data class Config(val codec: VideoCodec, val codecData: ByteArray) : VideoJob
-    data class Frame(val nalus: ByteArray, val receivedNs: Long = System.nanoTime()) : VideoJob
+    data class Config(
+        val codec: VideoCodec,
+        val codecData: ByteArray,
+        /** Real coded size from the protocol (0 = unknown, use sink defaults). */
+        val width: Int = 0,
+        val height: Int = 0,
+    ) : VideoJob {
+        /**
+         * True when [previous] describes the SAME decoder setup: identical
+         * codec, CSD AND coded size. A size change (1280x720 → 1920x1080 with
+         * the same SPS/PPS) must force a reconfigure — never be treated as a
+         * duplicate config.
+         */
+        fun sameDecoderSetupAs(previous: Config?): Boolean =
+            previous != null &&
+                previous.codec == codec &&
+                previous.codecData.contentEquals(codecData) &&
+                previous.width == width &&
+                previous.height == height
+    }
+
+    data class Frame(
+        val nalus: ByteArray,
+        val receivedNs: Long = System.nanoTime(),
+        /** Real presentation timestamp in µs; PTS_UNSPECIFIED falls back to a clock. */
+        val presentationTimeUs: Long = AudioAccessUnit.PTS_UNSPECIFIED,
+    ) : VideoJob
+
     data class SurfaceChanged(val surface: Surface?) : VideoJob
     data object Resync : VideoJob
 }

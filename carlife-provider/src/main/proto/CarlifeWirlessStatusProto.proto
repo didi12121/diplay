@@ -1,0 +1,5 @@
+package com.baidu.carlife.protobuf;
+message CarlifeWirlessStatus
+{
+    required int32 status = 1;
+}

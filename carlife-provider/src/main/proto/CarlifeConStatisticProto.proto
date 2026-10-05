@@ -1,0 +1,10 @@
+package com.baidu.carlife.protobuf;
+message CarlifeConnectStatistics
+{
+	required int32	contotal   = 1;
+	required int32  consuccess = 2;
+	required int32	confailed  = 3;
+	required int32	contime    = 4;
+	required int32	nerrorcount  = 5;
+	repeated int32	nerror_type  = 6;
+}
