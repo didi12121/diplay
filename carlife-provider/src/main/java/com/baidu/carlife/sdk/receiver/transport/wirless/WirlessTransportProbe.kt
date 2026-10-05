@@ -32,4 +32,11 @@ interface WirlessTransportProbe {
 
     /** TCP channel set complete: transport attached (protocol may now run). */
     fun onTransportAttached(host: String) {}
+
+    /**
+     * Transport startup/lifecycle failed (e.g. UDP 7999 bind refused). The
+     * failure is FINAL for this transport instance - the host must surface it
+     * immediately instead of waiting for a discovery timeout.
+     */
+    fun onTransportError(error: String) {}
 }

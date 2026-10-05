@@ -29,11 +29,22 @@ class GroupedProtocolTransport(private val context: CarLifeContext) :
 
     /**
      * DiPlay host-local extension (Phase 9.2W-A, diagnostics only): probe for
-     * wireless transport progress, handed to freshly built wirless transports.
-     * Never affects the protocol path.
+     * wireless transport progress. Never affects the protocol path.
+     *
+     * Phase 9.2W-A.1: the probe is propagated DYNAMICALLY into every
+     * configured wirless transport (not just at construction), because the
+     * host binds its session probe AFTER the transport may already exist -
+     * a constructor-captured probe would stay null and drop the real
+     * UDP_LISTENING/PHONE_DISCOVERED events.
      */
     @Volatile
     var transportProbe: WirlessTransportProbe? = null
+        set(value) {
+            field = value
+            synchronized(transports) {
+                transports.forEach { (it as? WirlessAPProtocolTransport)?.setProbeListener(value) }
+            }
+        }
 
     init {
         // init transports
@@ -82,15 +93,21 @@ class GroupedProtocolTransport(private val context: CarLifeContext) :
         stopConnect()
         when (context.getFeature(FEATURE_CONFIG_CONNECT_TYPE, CarLifeContext.CONNECTION_TYPE_AOA)) {
             CarLifeContext.CONNECTION_TYPE_HOTSPOT -> {
-                transports.add(WirlessAPProtocolTransport(context, this, transportProbe))
+                synchronized(transports) {
+                    transports.add(WirlessAPProtocolTransport(context, this, transportProbe))
+                }
                 context.connectionType = CarLifeContext.CONNECTION_TYPE_HOTSPOT
             }
             CarLifeContext.CONNECTION_TYPE_WIFIDIRECT -> {
-                transports.add(WirlessP2PProtocolTransport(context, this))
+                synchronized(transports) {
+                    transports.add(WirlessP2PProtocolTransport(context, this))
+                }
                 context.connectionType = CarLifeContext.CONNECTION_TYPE_WIFIDIRECT
             }
             else -> {
-                transports.add(AOAProtocolTransport(context, this))
+                synchronized(transports) {
+                    transports.add(AOAProtocolTransport(context, this))
+                }
                 context.connectionType = CarLifeContext.CONNECTION_TYPE_AOA
             }
         }

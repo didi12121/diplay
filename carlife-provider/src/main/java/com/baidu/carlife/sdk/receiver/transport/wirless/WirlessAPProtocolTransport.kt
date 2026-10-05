@@ -14,13 +14,25 @@ class WirlessAPProtocolTransport(
     private val mCarLifeContext: CarLifeContext,
     connectionListener: ConnectionListener?,
     // DiPlay host-local extension (Phase 9.2W-A): diagnostics-only probe.
-    private val probe: WirlessTransportProbe? = null,
+    probe: WirlessTransportProbe? = null,
 ) : ProtocolTransport(mCarLifeContext, connectionListener) {
     private var receiveBuf: ByteArray? = null
     private var mSocket: DatagramSocket? = null
     private var mPacket: DatagramPacket? = null
     private var mWIFIConnectThread: WifiConnectThread? = null
     private val mWirlessConnector = WirlessConnector(probe)
+
+    // DiPlay (9.2W-A.1): the probe is bound DYNAMICALLY (see setProbeListener)
+    // instead of constructor-captured, so a transport configured before the
+    // host bound its session probe is never left with a dead null probe.
+    @Volatile
+    private var probe: WirlessTransportProbe? = probe
+
+    /** DiPlay (9.2W-A.1): (re)binds the diagnostics probe of the live session. */
+    fun setProbeListener(listener: WirlessTransportProbe?) {
+        probe = listener
+        mWirlessConnector.probe = listener
+    }
 
     // DiPlay host-local extension: discovery datagram counter (diagnostics).
     private var udpPacketsReceived = 0
@@ -48,6 +60,10 @@ class WirlessAPProtocolTransport(
             }
         } catch (e: SocketException) {
             d(Constants.TAG, "connect error:", e)
+            // DiPlay (9.2W-A.1): a bind failure is a REAL, IMMEDIATE transport
+            // failure (e.g. UDP 7999 already taken) - never a silent log line
+            // that later masquerades as a 90s NO_DISCOVERY_PACKET timeout.
+            probe?.onTransportError("UDP_BIND_FAILED:${e.javaClass.simpleName}")
         }
     }
 

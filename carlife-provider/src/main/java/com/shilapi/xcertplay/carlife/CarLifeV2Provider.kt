@@ -188,26 +188,41 @@ class CarLifeV2Provider(
             //    the detach auto-reconnect so it can never come back.
             runCatching { facade.shutdown() }
         }
-        // ---- Transport selection (Phase 9.2W-A): configure BEFORE arming,
-        // without starting any network/USB work. Skipped when unchanged so the
-        // USB AOA path keeps exactly its Phase 9.1 behavior. ----
-        val connectType = transport.connectType()
-        if (connectType != configuredConnectType) {
-            runCatching { facade.configureConnectTypeWithoutStarting(connectType) }
-            configuredConnectType = connectType
-        }
-        // ---- Bind the new attempt ----
+        // ---- Bind the new attempt (armed = false) ----
+        // Registration MAY synchronously replay stale connection state - the
+        // attempt is not armed yet, so those events are dropped.
         val current = Attempt(token, listener, transport)
         current.listener = connectionListenerFor(current, token)
         current.progress = progressListenerFor(current, token)
         synchronized(lock) { attempt = current }
-        // Registration may synchronously replay stale connection state — the
-        // attempt is not armed yet, so those events are dropped.
         runCatching { facade.addConnectionListener(current.listener) }
         runCatching { facade.addProgressListener(current.progress) }
+        // ---- Bind the attempt-specific wireless probe BEFORE configuring
+        // (9.2W-A.1): the probe is propagated into the configured transport
+        // dynamically, so no real discovery event is ever dropped. ----
         runCatching { facade.setTransportProbeListener(probeListenerFor(current, token)) }
-        facade.connect()
+        // ---- FAIL-CLOSED transport selection (9.2W-A.1) ----
+        // The configuration must succeed BEFORE connect(); on failure the
+        // cache is NOT updated and connect() is NOT called - the physical
+        // transport can never drift from the resources the manager claimed.
+        val connectType = transport.connectType()
+        if (connectType != configuredConnectType) {
+            try {
+                facade.configureConnectTypeWithoutStarting(connectType)
+            } catch (error: Exception) {
+                // The receiver may be left half-reconfigured - never trust the
+                // cache again until an explicit reconfiguration succeeds, so a
+                // later request always retries configuration (no drift).
+                configuredConnectType = CONNECT_TYPE_UNKNOWN
+                throw error
+            }
+            configuredConnectType = connectType
+        }
+        // ---- Arm, then connect: real events caused by connect() (e.g. the
+        // synchronous UDP bind -> onUdpListening) belong to THIS attempt, while
+        // registration replay stays fenced by the pre-arming window. ----
         current.armed = true
+        facade.connect()
     }
 
     override fun stopConnection(token: CarLifeSessionToken) {
@@ -436,9 +451,20 @@ class CarLifeV2Provider(
             attempt.wireless.transportAttached = true
             stage(CarLifeProbeState.WIFI_TRANSPORT_ATTACHED)
         }
+
+        override fun onTransportError(error: String) {
+            if (!live()) return
+            // Immediate, real transport failure (e.g. UDP bind refused) - the
+            // backend terminates this attempt NOW instead of waiting for a
+            // discovery timeout that would misclassify it.
+            attempt.emit(CarLifeConnectionEvent.Failed(token, error))
+        }
     }
 
     companion object {
+        /** Cache sentinel: the receiver's transport state is unknown/broken. */
+        private const val CONNECT_TYPE_UNKNOWN = -1
+
         /** Real upstream receiver facade (one receiver per process). */
         internal fun realFacade(appContext: Context, config: CarLifeProviderConfig): CarLifeReceiverFacade {
             // DEMO_CHANNEL — NOT FOR PRODUCTION — COMPATIBILITY UNVERIFIED.

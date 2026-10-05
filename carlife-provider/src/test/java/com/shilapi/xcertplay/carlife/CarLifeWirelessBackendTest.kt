@@ -9,6 +9,7 @@ import com.shilapi.xcertplay.projection.ProjectionState
 import com.shilapi.xcertplay.projection.ProjectionTransport
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -33,6 +34,7 @@ class CarLifeWirelessBackendTest {
     private class FakeProvider : CarLifeProvider {
         override val isAvailable: Boolean get() = available
         var available = true
+        var throwOnStart: Exception? = null
         val started = mutableListOf<Pair<CarLifeSessionToken, CarLifeTransport>>()
         val stopped = mutableListOf<CarLifeSessionToken>()
         var diag = CarLifeProviderDiagnostics()
@@ -47,6 +49,7 @@ class CarLifeWirelessBackendTest {
             transport: CarLifeTransport,
             listener: (CarLifeConnectionEvent) -> Unit,
         ) {
+            throwOnStart?.let { throw it }
             started.add(token to transport)
             this.listener = listener
             // Realistic LAN diagnostics for this attempt (tests override).
@@ -332,5 +335,92 @@ class CarLifeWirelessBackendTest {
         h.backend.connect(wifiDevice)
         assertTrue(h.provider.started.isEmpty())
         assertTrue(h.backend.state is ProjectionState.Error)
+    }
+
+    // ---- Startup failure releases manager resources (9.2W-A.1 section 4) ----
+
+    @Test
+    fun startupFailureReleasesManagerLeasesImmediately() {
+        val manager = com.shilapi.xcertplay.projection.ProjectionManager()
+        val provider = FakeProvider()
+        provider.throwOnStart = IllegalStateException("configure failed")
+        val backend = CarLifeProjectionBackend(provider, CapturingScheduler(), 15_000)
+        manager.register(backend)
+
+        // ProjectionManager acquires WIFI+AUDIO BEFORE backend.connect()...
+        manager.connect(wifiDevice)
+        // ...the synchronous transport failure must publish Error AND confirm
+        // the session stopped so the leases are released immediately.
+        assertTrue(backend.state is ProjectionState.Error)
+        assertEquals(ProjectionErrorCode.CONNECT_FAILED, (backend.state as ProjectionState.Error).code)
+        assertTrue("manager leases must not leak", manager.resourcesHeldBy(CarLifeProjectionBackend.ID).isEmpty())
+        assertFalse(backend.isSessionActive)
+    }
+
+    @Test
+    fun startupFailureFencesTheHalfCreatedAttempt() {
+        val h = Harness()
+        h.provider.throwOnStart = IllegalStateException("connect failed")
+        h.backend.connect(wifiDevice)
+        // The minted token is fenced through the provider even though the
+        // attempt never completed (idempotent for fakes and real provider).
+        assertTrue(h.backend.probeReport().lastError!!.isNotEmpty())
+        assertTrue(h.backend.state is ProjectionState.Error)
+        // A later attempt works normally.
+        h.provider.throwOnStart = null
+        h.backend.connect(wifiDevice)
+        assertEquals(ProjectionState.Connecting, h.backend.state)
+    }
+
+    // ---- Transport-neutral attach semantics (9.2W-A.1 section 6) ----
+
+    @Test
+    fun wirelessAttachedReportsTransportNeutralState() {
+        val h = Harness()
+        val token = h.connect(ProjectionTransport.WIFI)
+        h.provider.emit(CarLifeConnectionEvent.Attached(token))
+        val report = h.backend.probeReport()
+        assertEquals(CarLifeProbeState.WIFI_TRANSPORT_ATTACHED, report.state)
+        // Do NOT report AOA for a wireless transport.
+        assertEquals("idle", report.aoaState)
+    }
+
+    @Test
+    fun usbAttachedStillReportsAoaAttached() {
+        val h = Harness()
+        val token = h.connect(ProjectionTransport.USB)
+        h.provider.emit(CarLifeConnectionEvent.Attached(token))
+        val report = h.backend.probeReport()
+        assertEquals(CarLifeProbeState.AOA_ATTACHED, report.state)
+        assertEquals("attached", report.aoaState)
+    }
+
+    @Test
+    fun wirelessReattachedStaysTransportNeutral() {
+        val h = Harness()
+        val token = h.connect(ProjectionTransport.WIFI)
+        h.provider.emit(CarLifeConnectionEvent.Reattached(token))
+        assertEquals(CarLifeProbeState.WIFI_TRANSPORT_ATTACHED, h.backend.probeReport().state)
+        assertEquals("idle", h.backend.probeReport().aoaState)
+    }
+
+    // ---- UDP bind failure is immediate and diagnostic (section 5) ----
+
+    @Test
+    fun udpBindFailureTerminatesImmediatelyWithoutTimeout() {
+        val h = Harness()
+        val token = h.connect(ProjectionTransport.WIFI)
+        // The real transport reports the bind failure as an immediate Failed
+        // event - the backend must terminate NOW, not fake a 90s discovery
+        // timeout.
+        h.provider.emit(CarLifeConnectionEvent.Failed(token, "UDP_BIND_FAILED:SocketException"))
+        val report = h.backend.probeReport()
+        assertEquals(CarLifeProbeState.ERROR, report.state)
+        assertEquals("UDP_BIND_FAILED:SocketException", report.lastError)
+        assertEquals(ProjectionErrorCode.TRANSPORT_ERROR, (h.backend.state as ProjectionState.Error).code)
+        assertFalse(h.backend.isSessionActive)
+        // The watchdog was cancelled by the immediate terminal state - the
+        // failure never waits for (or is misclassified by) the timeout.
+        assertNull(h.scheduler.pending)
     }
 }

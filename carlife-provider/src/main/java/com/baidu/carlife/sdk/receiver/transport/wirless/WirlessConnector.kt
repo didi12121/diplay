@@ -17,7 +17,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class WirlessConnector(
     // DiPlay host-local extension (Phase 9.2W-A): diagnostics-only probe.
-    private val probe: WirlessTransportProbe? = null,
+    // MUTABLE (9.2W-A.1): the owning transport may rebind it dynamically -
+    // the probe is never constructor-captured immutably.
+    @Volatile
+    var probe: WirlessTransportProbe? = null,
 ) : Communicator {
     companion object {
         private const val SERVER_CMD_SOCKET_PORT = 7240

@@ -274,6 +274,10 @@ class CarLifeProjectionBackend(
         stateStore.publish(ProjectionState.Connecting)
         try {
             provider.startConnection(token, transport, ::onConnectionEvent)
+            // A synchronous transport failure (e.g. UDP bind refused) may have
+            // already terminated this attempt INSIDE startConnection - never
+            // overwrite its terminal state or arm a dead watchdog.
+            if (!connectPending) return
             provider.diagnostics().let { diag ->
                 probeReport = probeReport.copy(
                     usbDevice = diag.usbDevices.joinToString().ifEmpty { null },
@@ -291,15 +295,41 @@ class CarLifeProjectionBackend(
             )
             armProbeTimeout(token)
         } catch (error: Exception) {
-            connectPending = false
-            activeSession = null
-            probeReport = probeReport.copy(
-                state = CarLifeProbeState.ERROR,
-                blocker = CarLifeBlocker.OTHER,
-                lastError = error.javaClass.simpleName,
-            )
-            publishError(ProjectionErrorCode.CONNECT_FAILED, "CarLife connect failed: ${error.javaClass.simpleName}")
+            // STARTUP FAILURE (9.2W-A.1): resources were already acquired by
+            // ProjectionManager - fence everything for THIS token and confirm
+            // the session stopped so the WIFI/USB + AUDIO leases are released
+            // immediately (never leaked until the next connect).
+            failStartup(token, error)
         }
+    }
+
+    /**
+     * Synchronous start failure after resource acquisition: fences the
+     * provider attempt (if created), clears all session state for [token],
+     * closes its video/touch paths, publishes Error and confirms the session
+     * stopped so shared resource leases are released immediately.
+     */
+    private fun failStartup(token: CarLifeSessionToken, error: Exception) {
+        cancelProbeTimeout()
+        connectPending = false
+        isSessionActive = false
+        activeSession = null
+        runCatching { provider.stopConnection(token) }
+        provider.detachVideo(token)
+        closeVideoSink(token)
+        clearTouchGestureState()
+        probeReport = probeReport.copy(
+            state = CarLifeProbeState.ERROR,
+            blocker = CarLifeBlocker.OTHER,
+            lastError = error.javaClass.simpleName,
+            decoderState = "stopped",
+            touchState = "waiting",
+            touchSurfaceWidth = null,
+            touchSurfaceHeight = null,
+        )
+        publishError(ProjectionErrorCode.CONNECT_FAILED, "CarLife connect failed: ${error.javaClass.simpleName}")
+        // Confirm stop -> ProjectionManager releases USB/WIFI + AUDIO now.
+        sessionStoppedListener?.run()
     }
 
     override fun disconnect(): Boolean {
@@ -471,11 +501,18 @@ class CarLifeProjectionBackend(
         when (event) {
             is CarLifeConnectionEvent.Attached -> {
                 cancelProbeTimeout()
-                probeReport = probeReport.copy(
-                    state = CarLifeProbeState.AOA_ATTACHED,
-                    aoaState = "attached",
-                    connectionState = 1,
-                )
+                // Transport-neutral attach (9.2W-A.1): only the AOA transport
+                // reports AOA; WIFI_AP reports WIFI_TRANSPORT_ATTACHED. The
+                // success criterion stays CONNECTION_ESTABLISHED.
+                probeReport = if (activeTransport == CarLifeTransport.WIFI_AP) {
+                    probeReport.copy(state = CarLifeProbeState.WIFI_TRANSPORT_ATTACHED, connectionState = 1)
+                } else {
+                    probeReport.copy(
+                        state = CarLifeProbeState.AOA_ATTACHED,
+                        aoaState = "attached",
+                        connectionState = 1,
+                    )
+                }
                 armProbeTimeout(current)
                 // Open the session video pipeline EARLY (idempotent): the
                 // phone may answer VIDEO_ENCODER_INIT_DONE right after
@@ -486,7 +523,11 @@ class CarLifeProjectionBackend(
             }
             is CarLifeConnectionEvent.Reattached -> {
                 ensureVideoSink(current)
-                probeReport = probeReport.copy(state = CarLifeProbeState.AOA_ATTACHED, aoaState = "reattached")
+                probeReport = if (activeTransport == CarLifeTransport.WIFI_AP) {
+                    probeReport.copy(state = CarLifeProbeState.WIFI_TRANSPORT_ATTACHED)
+                } else {
+                    probeReport.copy(state = CarLifeProbeState.AOA_ATTACHED, aoaState = "reattached")
+                }
                 stateStore.publish(ProjectionState.Connecting)
             }
             is CarLifeConnectionEvent.Progress -> {
@@ -542,6 +583,9 @@ class CarLifeProjectionBackend(
                 finishSession(CarLifeProbeState.DETACHED, blocker = CarLifeBlocker.NONE)
             }
             is CarLifeConnectionEvent.Failed -> {
+                // Real transport failure (e.g. UDP_BIND_FAILED) - immediate,
+                // precise, never collapsed into a discovery timeout.
+                probeReport = probeReport.copy(lastError = event.message)
                 finishSession(
                     CarLifeProbeState.ERROR,
                     blocker = CarLifeBlocker.OTHER,
