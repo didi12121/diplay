@@ -699,6 +699,8 @@ class DiPlayActivity : ComponentActivity() {
             appendLine("video handshake: initSent=${report.videoInitSent} initDone=${report.videoInitDoneReceived} startSent=${report.videoStartSent} dataSeen=${report.videoDataSeen}")
             appendLine("pts: ${report.ptsSource}  decoder: ${report.decoderState}  firstFrame: ${report.firstFrameRendered}")
             appendLine("video error: ${report.lastVideoError ?: "-"}  phone CarLife protocol: ${report.phoneCarlifeProtocolVersion ?: "0 (not reported)"}")
+            appendLine("touch: ${report.touchState} sent=${report.touchEventsSent} down=${report.touchDownCount} move=${report.touchMoveCount} up=${report.touchUpCount} cancel=${report.touchCancelCount} dropped=${report.touchDropped}")
+            appendLine("touch last: ${report.lastTouchAction ?: "-"} @ ${report.lastTouchX ?: "-"},${report.lastTouchY ?: "-"}  surface: ${report.touchSurfaceWidth ?: "-"}x${report.touchSurfaceHeight ?: "-"}  error: ${report.lastTouchError ?: "-"}")
             append("DEMO_CHANNEL — NOT FOR PRODUCTION — COMPATIBILITY UNVERIFIED")
         }
         // First real video config -> open the shared projection page

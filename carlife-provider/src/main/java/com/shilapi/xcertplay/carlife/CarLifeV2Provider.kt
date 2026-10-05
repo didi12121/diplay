@@ -2,6 +2,7 @@
 package com.shilapi.xcertplay.carlife
 
 import android.content.Context
+import android.view.MotionEvent
 import com.baidu.carlife.sdk.CarLifeContext
 import com.baidu.carlife.sdk.Configs
 import com.baidu.carlife.sdk.ConnectionChangeListener
@@ -33,6 +34,12 @@ interface CarLifeReceiverFacade {
     fun carlifeVersion(): Int
     /** USB candidates as "VID:PID" only — never serials or personal data. */
     fun usbDeviceSummaries(): List<String>
+
+    // ---- High-level touch uplink (Phase 9.2b) ----
+    /** Content-LOCAL surface size feeding RemoteControlManager's final mapping. */
+    fun onSurfaceSizeChanged(width: Int, height: Int) {}
+    /** Synchronous high-level touch send (CarLifeReceiver.onTouchEvent). */
+    fun onTouchEvent(event: MotionEvent) {}
 }
 
 /**
@@ -85,6 +92,23 @@ class CarLifeV2Provider(
 
         lateinit var listener: ConnectionChangeListener
         lateinit var progress: ConnectProgressListener
+
+        /** Guards the touch surface bookkeeping below. */
+        val touchLock = Any()
+
+        /** Content-LOCAL touch surface declared for this attempt (0 = none). */
+        @Volatile
+        var surfaceWidth = 0
+
+        @Volatile
+        var surfaceHeight = 0
+
+        /** Last size actually pushed to the captured receiver (-1 = never). */
+        @Volatile
+        var pushedSurfaceWidth = -1
+
+        @Volatile
+        var pushedSurfaceHeight = -1
 
         fun emit(event: CarLifeConnectionEvent) {
             if (!armed) return // registration replay or pre-connect leftover
@@ -163,6 +187,47 @@ class CarLifeV2Provider(
         val facade = facade ?: return
         val bridge = videoBridges.remove(token) ?: return
         runCatching { facade.removeTransportListener(bridge) }
+    }
+
+    // ---- Touch uplink (Phase 9.2b): session-fenced, high-level API only ----
+
+    /** The armed attempt of [token], or null when [token] is stale. */
+    private fun armedAttempt(token: CarLifeSessionToken): Attempt? =
+        synchronized(lock) { attempt }?.takeIf { it.token == token && it.armed }
+
+    override fun updateTouchSurface(token: CarLifeSessionToken, width: Int, height: Int) {
+        val facade = facade ?: return
+        val current = armedAttempt(token) ?: return // stale token: rejected
+        synchronized(current.touchLock) {
+            current.surfaceWidth = width
+            current.surfaceHeight = height
+            pushTouchSurface(current, facade)
+        }
+    }
+
+    override fun sendTouch(token: CarLifeSessionToken, event: MotionEvent): Boolean {
+        val facade = facade ?: return false
+        val current = armedAttempt(token) ?: return false // stale token: rejected
+        synchronized(current.touchLock) {
+            // A touch is only meaningful once its coordinate frame is known:
+            // the receiver must get the surface size before/with the first
+            // event so RemoteControlManager maps exactly once.
+            if (current.surfaceWidth <= 0 || current.surfaceHeight <= 0) return false
+            pushTouchSurface(current, facade)
+            // Synchronous borrow: the caller recycles `event` after this call.
+            return runCatching { facade.onTouchEvent(event) }.isSuccess
+        }
+    }
+
+    /** Pushes the declared surface size at most once per change (per attempt). */
+    private fun pushTouchSurface(current: Attempt, facade: CarLifeReceiverFacade) {
+        val width = current.surfaceWidth
+        val height = current.surfaceHeight
+        if (width <= 0 || height <= 0) return
+        if (current.pushedSurfaceWidth == width && current.pushedSurfaceHeight == height) return
+        runCatching { facade.onSurfaceSizeChanged(width, height) }
+        current.pushedSurfaceWidth = width
+        current.pushedSurfaceHeight = height
     }
 
     override fun dispose() {
@@ -276,6 +341,12 @@ class CarLifeV2Provider(
         override fun protocolVersion(): Int = receiver.protocolVersion
 
         override fun carlifeVersion(): Int = receiver.carlifeVersion
+
+        override fun onSurfaceSizeChanged(width: Int, height: Int) =
+            receiver.onSurfaceSizeChanged(width, height)
+
+        override fun onTouchEvent(event: MotionEvent) =
+            receiver.onTouchEvent(event)
 
         override fun usbDeviceSummaries(): List<String> {
             // VID:PID only — never serial numbers or other identifying data.

@@ -81,6 +81,15 @@ class ProjectionSessionActivity : Activity(), SurfaceHolder.Callback {
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         surfaceView = SurfaceView(this).also {
             it.holder.addCallback(this)
+            // Phase 9.2b: capture touch on the ACTUAL projection surface. The
+            // listener always consumes after forwarding, so one MotionEvent
+            // becomes exactly one ProjectionTouchEvent for the bound backend —
+            // the same event can never fall through to Activity.onTouchEvent
+            // and be delivered twice (no double DOWN/MOVE/UP).
+            it.setOnTouchListener { _, motionEvent ->
+                dispatchProjectionTouch(motionEvent)
+                true
+            }
             root.addView(it, FrameLayout.LayoutParams(-1, -1))
         }
         statusView = TextView(this).apply {
@@ -134,7 +143,14 @@ class ProjectionSessionActivity : Activity(), SurfaceHolder.Callback {
 
     // ---- Input: unified touch events to the BOUND backend only ----
 
-    override fun onTouchEvent(event: MotionEvent): Boolean {
+    /**
+     * The single touch-forwarding seam: one Android [MotionEvent] → one
+     * `ProjectionTouchEvent` → the backend bound at creation. Coordinates stay
+     * raw view pixels plus geometry; each backend maps them (CarLife maps into
+     * content-local space and lets the SDK do the final video mapping).
+     */
+    private fun dispatchProjectionTouch(event: MotionEvent): Boolean {
+        val backend = boundBackend() ?: return false
         val width = if (surfaceWidth > 0) surfaceWidth else viewWidth()
         val height = if (surfaceHeight > 0) surfaceHeight else viewHeight()
         val geometry = ProjectionDisplayGeometry(
@@ -142,8 +158,14 @@ class ProjectionSessionActivity : Activity(), SurfaceHolder.Callback {
             screenHeight = height,
             contentRect = ProjectionRect(0f, 0f, width.toFloat(), height.toFloat()),
         )
-        val backend = boundBackend() ?: return super.onTouchEvent(event)
-        return backend.onTouchEvent(ProjectionTouchEvents.from(event, geometry)) || super.onTouchEvent(event)
+        return backend.onTouchEvent(ProjectionTouchEvents.from(event, geometry))
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        // Fallback only: touches the surfaceView already claimed are consumed
+        // by its listener above and never reach this method, so there is no
+        // duplicate delivery.
+        return dispatchProjectionTouch(event) || super.onTouchEvent(event)
     }
 
     override fun onBackPressed() {

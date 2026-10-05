@@ -124,6 +124,27 @@ data class CarLifeProbeReport(
     val videoInitDoneReceived: Boolean = false,
     val videoStartSent: Boolean = false,
     val videoDataSeen: Boolean = false,
+    // ---- Touch diagnostics (Phase 9.2b; counts only, no user content) ----
+    /** "enabled" (Connected) / "waiting" (no session) / "error" (send failed). */
+    val touchState: String = "waiting",
+    /** Touch events accepted by the provider (sent to the phone). */
+    val touchEventsSent: Int = 0,
+    val touchDownCount: Int = 0,
+    val touchMoveCount: Int = 0,
+    val touchUpCount: Int = 0,
+    val touchCancelCount: Int = 0,
+    /** Last accepted action: DOWN/MOVE/UP/CANCEL. */
+    val lastTouchAction: String? = null,
+    /** Last content-LOCAL coordinate sent (x,y). */
+    val lastTouchX: Float? = null,
+    val lastTouchY: Float? = null,
+    /** Touch surface currently declared to the SDK (content pixels). */
+    val touchSurfaceWidth: Int? = null,
+    val touchSurfaceHeight: Int? = null,
+    /** Touch events rejected (stale session, outside content, send failure). */
+    val touchDropped: Int = 0,
+    /** Last rejection reason / failure class name (diagnostic only). */
+    val lastTouchError: String? = null,
 )
 
 /**

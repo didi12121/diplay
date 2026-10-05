@@ -3,6 +3,7 @@ package com.shilapi.xcertplay.carlife
 
 import android.app.Activity
 import android.content.Context
+import android.view.MotionEvent
 
 /**
  * Isolation seam between the DiPlay projection core and the open CarLife V2
@@ -40,6 +41,27 @@ interface CarLifeProvider {
     fun attachVideo(token: CarLifeSessionToken, video: CarLifeVideoListener) {}
 
     fun detachVideo(token: CarLifeSessionToken) {}
+
+    /**
+     * Declares the size of the projection content DiPlay sends touch
+     * coordinates in (content-LOCAL pixels, see
+     * [CarLifeProjectionBackend.onTouchEvent]). The provider forwards it to
+     * `CarLifeReceiver.onSurfaceSizeChanged(...)` so the SDK's
+     * RemoteControlManager performs the final surface → video mapping.
+     * Rejected when [token] is not the current armed attempt.
+     */
+    fun updateTouchSurface(token: CarLifeSessionToken, width: Int, height: Int) {}
+
+    /**
+     * Sends ONE synchronous touch uplink for [token] through the high-level
+     * CarLife API (`CarLifeReceiver.onTouchEvent(MotionEvent)` →
+     * RemoteControlManager → phone). [event] carries content-LOCAL coordinates
+     * and is only borrowed for the synchronous send — implementations must not
+     * retain or recycle it. Returns true when the event reached the receiver;
+     * false when the call was rejected (stale token, no current attempt) or
+     * failed.
+     */
+    fun sendTouch(token: CarLifeSessionToken, event: MotionEvent): Boolean = false
 
     fun dispose()
 

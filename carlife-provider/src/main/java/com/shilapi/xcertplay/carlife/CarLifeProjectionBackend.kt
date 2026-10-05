@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only (DiPlay additions; upstream SDK code keeps Apache-2.0)
 package com.shilapi.xcertplay.carlife
 
+import android.os.SystemClock
+import android.view.MotionEvent
 import com.shilapi.xcertplay.projection.ProjectionBackend
 import com.shilapi.xcertplay.projection.ProjectionCapabilities
 import com.shilapi.xcertplay.projection.ProjectionDevice
@@ -10,6 +12,7 @@ import com.shilapi.xcertplay.projection.ProjectionResource
 import com.shilapi.xcertplay.projection.ProjectionState
 import com.shilapi.xcertplay.projection.ProjectionStateListener
 import com.shilapi.xcertplay.projection.ProjectionStateStore
+import com.shilapi.xcertplay.projection.ProjectionTouchAction
 import com.shilapi.xcertplay.projection.ProjectionTouchEvent
 import java.util.concurrent.atomic.AtomicLong
 
@@ -57,12 +60,24 @@ object SystemCarLifeProbeTimeoutScheduler : CarLifeProbeTimeoutScheduler {
  * with a `stale-video-*-ignored` diagnostic and never reaches the live
  * decoder. Media ownership rules: teardown of session A can never close
  * session B's decoder.
+ *
+ * Phase 9.2b adds REAL TOUCH: unified [ProjectionTouchEvent]s are mapped to
+ * content-LOCAL coordinates and forwarded through the HIGH-LEVEL CarLife API
+ * ([CarLifeProvider.updateTouchSurface] / [CarLifeProvider.sendTouch] →
+ * `CarLifeReceiver.onSurfaceSizeChanged` / `onTouchEvent` →
+ * RemoteControlManager → phone). The custom CarLife touch protocol is NEVER
+ * reimplemented here, and coordinates are NEVER pre-scaled to video size:
+ * RemoteControlManager performs the single surface → video mapping in the
+ * SDK. Touch is session-scoped exactly like video — a stale touch from a dead
+ * session is dropped with a `stale-touch-ignored` diagnostic.
  */
 class CarLifeProjectionBackend(
     private val provider: CarLifeProvider,
     private val timeoutScheduler: CarLifeProbeTimeoutScheduler = SystemCarLifeProbeTimeoutScheduler,
     private val probeTimeoutMillis: Long = DEFAULT_PROBE_TIMEOUT_MILLIS,
     private val videoSinkProvider: CarLifeVideoSinkProvider? = null,
+    /** Event clock for MotionEvent timestamps (SystemClock.uptimeMillis). */
+    private val clock: () -> Long = { SystemClock.uptimeMillis() },
 ) : ProjectionBackend {
 
     override val id: String = ID
@@ -104,6 +119,16 @@ class CarLifeProjectionBackend(
     private var videoConfigCount = 0
     private var videoBytes = 0L
     private var keyframeCount = 0
+
+    // ---- Touch uplink state (session-scoped, Phase 9.2b) ----
+    private val touchLock = Any()
+
+    /** downTime of the current gesture; 0 = no live gesture. */
+    private var gestureDownTime = 0L
+
+    /** Last touch surface declared to the SDK (0 = none) — never resent unchanged. */
+    private var lastTouchSurfaceWidth = 0
+    private var lastTouchSurfaceHeight = 0
 
     override val state: ProjectionState
         get() = stateStore.state
@@ -154,6 +179,9 @@ class CarLifeProjectionBackend(
         videoConfigCount = 0
         videoBytes = 0
         keyframeCount = 0
+        // Fresh session: no gesture or surface-size state may leak in from a
+        // previous one (reconnect cannot receive a previous session gesture).
+        clearTouchGestureState()
         probeReport = CarLifeProbeReport(
             state = CarLifeProbeState.USB_DEVICE_FOUND,
             blocker = CarLifeBlocker.NO_REAL_DEVICE,
@@ -197,8 +225,131 @@ class CarLifeProjectionBackend(
     }
 
     override fun onTouchEvent(event: ProjectionTouchEvent): Boolean {
-        // Phase 9.2b: touch uplink.
-        return false
+        // ---- 1/2. Session fencing: touch belongs to exactly one live session.
+        // A late Activity/event of session A must never reach session B.
+        val token = activeSession
+        if (!isSessionActive || token == null || state != ProjectionState.Connected) {
+            dropTouch("stale-touch-ignored")
+            return false
+        }
+        // 3. Pointer list must not be empty.
+        val pointer = event.pointers.firstOrNull()
+        if (pointer == null) {
+            dropTouch("empty-pointer-list")
+            return false
+        }
+        // 4. Only touches inside the projected content are forwarded.
+        val rect = event.geometry.contentRect
+        if (!rect.contains(pointer.x, pointer.y)) {
+            dropTouch("touch-outside-content")
+            return false
+        }
+        val surfaceWidth = rect.width.toInt()
+        val surfaceHeight = rect.height.toInt()
+        if (surfaceWidth <= 0 || surfaceHeight <= 0) {
+            dropTouch("invalid-touch-surface")
+            return false
+        }
+        // 5. View -> content-LOCAL coordinates. RemoteControlManager performs
+        //    the final surface -> video mapping in the SDK — do NOT pre-scale
+        //    to video size here (that would double-scale).
+        val localX = pointer.x - rect.left
+        val localY = pointer.y - rect.top
+
+        val now = clock()
+        synchronized(touchLock) {
+            // 6. Touch surface size — declared only when the geometry changed.
+            if (lastTouchSurfaceWidth != surfaceWidth || lastTouchSurfaceHeight != surfaceHeight) {
+                try {
+                    provider.updateTouchSurface(token, surfaceWidth, surfaceHeight)
+                } catch (error: Exception) {
+                    dropTouch(error.javaClass.simpleName)
+                    return false
+                }
+                lastTouchSurfaceWidth = surfaceWidth
+                lastTouchSurfaceHeight = surfaceHeight
+                probeReport = probeReport.copy(
+                    touchSurfaceWidth = surfaceWidth,
+                    touchSurfaceHeight = surfaceHeight,
+                )
+            }
+
+            // 7. ONE Android MotionEvent per unified event (single touch).
+            //    Gesture state: DOWN mints a fresh downTime; MOVE/UP/CANCEL
+            //    reuse the live gesture's downTime.
+            val downTime = when (event.action) {
+                ProjectionTouchAction.DOWN -> {
+                    gestureDownTime = now
+                    now
+                }
+                else -> {
+                    if (gestureDownTime == 0L) gestureDownTime = now
+                    gestureDownTime
+                }
+            }
+            val motionAction = when (event.action) {
+                ProjectionTouchAction.DOWN -> MotionEvent.ACTION_DOWN
+                ProjectionTouchAction.MOVE -> MotionEvent.ACTION_MOVE
+                ProjectionTouchAction.UP -> MotionEvent.ACTION_UP
+                ProjectionTouchAction.CANCEL -> MotionEvent.ACTION_CANCEL
+            }
+            val motion = MotionEvent.obtain(downTime, now, motionAction, localX, localY, 0)
+            // 8. Synchronous high-level send; the event is borrowed only for
+            //    the call and recycled immediately afterwards.
+            var sendError: String? = null
+            val sent = try {
+                provider.sendTouch(token, motion)
+            } catch (error: Exception) {
+                sendError = error.javaClass.simpleName
+                false
+            } finally {
+                motion.recycle()
+            }
+            if (motionAction == MotionEvent.ACTION_UP || motionAction == MotionEvent.ACTION_CANCEL) {
+                // Gesture ended: the next gesture gets a fresh downTime.
+                gestureDownTime = 0L
+            }
+            // 9. Accepted send -> exactly one counted touch event.
+            if (!sent) {
+                dropTouch(sendError ?: "touch-send-rejected")
+                probeReport = probeReport.copy(touchState = "error")
+                return false
+            }
+            recordTouch(event.action, localX, localY)
+        }
+        return true
+    }
+
+    /** Counts one accepted touch event (no history, no user content). */
+    private fun recordTouch(action: ProjectionTouchAction, x: Float, y: Float) {
+        probeReport = probeReport.copy(
+            touchState = "enabled",
+            touchEventsSent = probeReport.touchEventsSent + 1,
+            touchDownCount = probeReport.touchDownCount + if (action == ProjectionTouchAction.DOWN) 1 else 0,
+            touchMoveCount = probeReport.touchMoveCount + if (action == ProjectionTouchAction.MOVE) 1 else 0,
+            touchUpCount = probeReport.touchUpCount + if (action == ProjectionTouchAction.UP) 1 else 0,
+            touchCancelCount = probeReport.touchCancelCount + if (action == ProjectionTouchAction.CANCEL) 1 else 0,
+            lastTouchAction = action.name,
+            lastTouchX = x,
+            lastTouchY = y,
+        )
+    }
+
+    /** Counts one rejected touch event with its reason (diagnostic only). */
+    private fun dropTouch(reason: String) {
+        probeReport = probeReport.copy(
+            touchDropped = probeReport.touchDropped + 1,
+            lastTouchError = reason,
+        )
+    }
+
+    /** Clears gesture + surface cache so a new session cannot inherit state. */
+    private fun clearTouchGestureState() {
+        synchronized(touchLock) {
+            gestureDownTime = 0L
+            lastTouchSurfaceWidth = 0
+            lastTouchSurfaceHeight = 0
+        }
     }
 
     override fun onKeyEvent(event: ProjectionKeyEvent): Boolean {
@@ -211,6 +362,7 @@ class CarLifeProjectionBackend(
         val token = activeSession
         provider.detachVideo(token ?: CarLifeSessionToken(-1))
         closeVideoSink(token)
+        clearTouchGestureState()
         runCatching { provider.dispose() }
         isSessionActive = false
         connectPending = false
@@ -269,6 +421,8 @@ class CarLifeProjectionBackend(
                 // REAL VIDEO: ensure the session-scoped video pipeline exists
                 // (opened at Attached already; idempotent per token).
                 ensureVideoSink(current)
+                // Touch uplink is live from here on.
+                probeReport = probeReport.copy(touchState = "enabled")
                 stateStore.publish(ProjectionState.Connected)
             }
             is CarLifeConnectionEvent.VersionNotSupported -> {
@@ -318,10 +472,15 @@ class CarLifeProjectionBackend(
         isSessionActive = false
         provider.detachVideo(token ?: CarLifeSessionToken(-1))
         closeVideoSink(token)
+        // Session over: gesture state and the touch surface cache die with it.
+        clearTouchGestureState()
         probeReport = probeReport.copy(
             state = probeState,
             blocker = blocker,
             decoderState = if (errorCode != null) "error" else "stopped",
+            touchState = "waiting",
+            touchSurfaceWidth = null,
+            touchSurfaceHeight = null,
         )
         if (errorCode != null) {
             publishError(errorCode, message ?: "CarLife session failed")

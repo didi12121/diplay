@@ -19,7 +19,10 @@ object ProjectionTouchEvents {
         for (index in 0 until event.pointerCount) {
             pointers.add(
                 ProjectionTouchPointer(
-                    id = index,
+                    // Phase 9.2b: the contact id MUST be the Android pointer id
+                    // (stable across DOWN..UP); the slot index is NOT stable
+                    // once pointers are lifted out of order.
+                    id = event.getPointerId(index),
                     x = event.getX(index),
                     y = event.getY(index),
                     down = !allUp && index != liftedIndex,
