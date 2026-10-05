@@ -225,6 +225,11 @@ class CarLifeReceiverImpl(
         transport.transportProbe = listener
     }
 
+    /** DiPlay host-local extension (Phase 9.2W-B1): see CarLifeReceiver. */
+    override fun setWirelessPhoneIp(ip: String) {
+        transport.wirelessPhoneIp = ip
+    }
+
     /**
      *  监听usb广播消息，被动接受连接。
      */

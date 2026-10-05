@@ -8,6 +8,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Build
 import com.baidu.carlife.sdk.CarLifeContext
 import com.baidu.carlife.sdk.Configs.CONFIG_TARGET_BLUETOOTH_NAME
 import com.baidu.carlife.sdk.Constants
@@ -27,6 +28,17 @@ class BluetoothDeviceDiscover(
         fun onDeviceConnected(communicator: BluetoothCommunicator)
     }
 
+    companion object {
+        /**
+         * DiPlay host-local extension (Phase 9.2W-B1): explicit export flag for
+         * the dynamic Bluetooth receiver (unit-testable, no device).
+         * RECEIVER_NOT_EXPORTED = 4 (Context constant, API 33+); the receiver
+         * only sees protected system Bluetooth broadcasts.
+         */
+        fun receiverFlags(): Int =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) 0x4 else 0
+    }
+
     private val bluetoothAdapter by lazy {
         (context.applicationContext
             .getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager)
@@ -36,6 +48,15 @@ class BluetoothDeviceDiscover(
     private val targetName by lazy { context.getConfig<String>(CONFIG_TARGET_BLUETOOTH_NAME) }
 
     private var connectedCommunicator: BluetoothCommunicator? = null
+
+    // DiPlay host-local extension (9.2W-B1): the in-flight RFCOMM socket so a
+    // session stop can abort a blocking connect(); and idempotent receiver
+    // registration (start/stop/start never double-registers or leaks).
+    @Volatile
+    private var pendingSocket: BluetoothSocket? = null
+
+    @Volatile
+    private var receiverRegistered = false
 
     private var isReady = false
 
@@ -57,8 +78,36 @@ class BluetoothDeviceDiscover(
 
     fun startDiscover() {
         isReady = true
-        context.applicationContext.registerReceiver(this, filter)
+        // DiPlay fix (9.2W-B1): idempotent registration - a restarted session
+        // must never hit "Receiver already registered" / leak a receiver.
+        registerReceiverIfNeeded()
         context.main().post(discoverRunnable)
+    }
+
+    /** DiPlay (9.2W-B1): API 33+ uses RECEIVER_NOT_EXPORTED; double-register safe. */
+    private fun registerReceiverIfNeeded() {
+        if (receiverRegistered) return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.applicationContext.registerReceiver(this, filter, receiverFlags())
+            } else {
+                context.applicationContext.registerReceiver(this, filter)
+            }
+            receiverRegistered = true
+        } catch (e: Exception) {
+            Logger.e(Constants.TAG, "BluetoothDeviceDiscover registerReceiver exception ", e)
+        }
+    }
+
+    /** DiPlay (9.2W-B1): idempotent unregistration. */
+    private fun unregisterReceiverIfNeeded() {
+        if (!receiverRegistered) return
+        try {
+            context.applicationContext.unregisterReceiver(this)
+        } catch (e: Exception) {
+            Logger.e(Constants.TAG, "BluetoothDeviceDiscover unregisterReceiver exception ", e)
+        }
+        receiverRegistered = false
     }
 
     private fun discoverDevice() {
@@ -116,20 +165,36 @@ class BluetoothDeviceDiscover(
         val socket = device.createRfcommSocketToServiceRecord(
             UUID.fromString(Constants.BLUETOOTH_COMMUNICATE_UUID)
         )
-        socket.connect()
+        // DiPlay (9.2W-B1): track the in-flight socket so terminate() can
+        // abort a blocking connect() of a dead session.
+        pendingSocket = socket
+        try {
+            socket.connect()
+        } finally {
+            pendingSocket = null
+        }
         return socket
     }
 
     fun terminate() {
         isReady = false
+        // DiPlay fix (9.2W-B1): deterministic session teardown - abort the
+        // in-flight RFCOMM connect, close the live communicator, drop every
+        // callback and ALWAYS unregister (it used to leak when no connection
+        // had ever succeeded, breaking the next session's startDiscover()).
+        pendingSocket?.let { runCatching { it.close() } }
+        pendingSocket = null
         connectedCommunicator?.terminate()
+        connectedCommunicator = null
+        context.main().removeCallbacks(discoverRunnable)
+        unregisterReceiverIfNeeded()
     }
 
     // Communicator.Callbacks
     override fun onTerminated(channel: Int) {
         // 如果连接断开了，应该重新尝试连接
         connectedCommunicator = null
-        context.applicationContext.unregisterReceiver(this)
+        unregisterReceiverIfNeeded()
         context.main().removeCallbacks(discoverRunnable)
     }
 
@@ -160,12 +225,16 @@ class BluetoothDeviceDiscover(
     }
 
     private fun isConnected(device: BluetoothDevice): Boolean {
-        try {
+        // DiPlay fix (9.2W-B1): the reflection probe is UNSAFE when it fails
+        // (it used to return true for every bonded device). The modern path
+        // never relies on it - deterministic CONFIG_TARGET_BLUETOOTH_NAME
+        // exact-name selection is required instead.
+        return try {
             val isConnectedMethod = device.javaClass.getMethod("isConnected")
-            return isConnectedMethod.invoke(device) as Boolean
+            isConnectedMethod.invoke(device) as Boolean
         } catch (e: Exception) {
             Logger.e(Constants.TAG, "BluetoothDeviceDiscover isConnected exception ", e)
-            return true
+            false
         }
     }
 }

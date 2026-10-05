@@ -46,6 +46,20 @@ class GroupedProtocolTransport(private val context: CarLifeContext) :
             }
         }
 
+    /**
+     * DiPlay host-local extension (Phase 9.2W-B1): protocol-provided phone IP
+     * for the BT hotspot mode. Propagated like [transportProbe]; when set the
+     * wirless transport opens the TCP channel set directly (no UDP 7999).
+     */
+    @Volatile
+    var wirelessPhoneIp: String? = null
+        set(value) {
+            field = value
+            synchronized(transports) {
+                transports.forEach { (it as? WirlessAPProtocolTransport)?.phoneIp = value }
+            }
+        }
+
     init {
         // init transports
         configConnectType()
@@ -94,7 +108,11 @@ class GroupedProtocolTransport(private val context: CarLifeContext) :
         when (context.getFeature(FEATURE_CONFIG_CONNECT_TYPE, CarLifeContext.CONNECTION_TYPE_AOA)) {
             CarLifeContext.CONNECTION_TYPE_HOTSPOT -> {
                 synchronized(transports) {
-                    transports.add(WirlessAPProtocolTransport(context, this, transportProbe))
+                    transports.add(
+                        WirlessAPProtocolTransport(context, this, transportProbe).also {
+                            it.phoneIp = wirelessPhoneIp
+                        },
+                    )
                 }
                 context.connectionType = CarLifeContext.CONNECTION_TYPE_HOTSPOT
             }

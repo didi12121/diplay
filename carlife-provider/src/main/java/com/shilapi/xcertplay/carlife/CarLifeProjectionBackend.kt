@@ -173,6 +173,18 @@ class CarLifeProjectionBackend(
             tcpTouch = diag.tcpChannels["touch"],
             tcpUpdate = diag.tcpChannels["update"],
             transportAttached = diag.transportAttached,
+            // ---- Modern Bluetooth bootstrap (9.2W-B1; names only) ----
+            btPermission = diag.btPermission,
+            btTarget = diag.btTarget ?: probeReport.btTarget,
+            btBonded = diag.btBonded ?: probeReport.btBonded,
+            btRfcomm = diag.btRfcomm,
+            btInfoRequest = diag.btInfoRequest,
+            btInfoResponse = diag.btInfoResponse,
+            btAdvertisedType = diag.btAdvertisedType ?: probeReport.btAdvertisedType,
+            btTargetInfoRequest = diag.btTargetInfoRequest,
+            btRequestIpSent = false,
+            btResponseIpReceived = diag.btResponseIpReceived,
+            modernWirelessPath = diag.modernWirelessPath ?: probeReport.modernWirelessPath,
         )
     }
 
@@ -256,21 +268,39 @@ class CarLifeProjectionBackend(
         // Fresh session: no gesture or surface-size state may leak in from a
         // previous one (reconnect cannot receive a previous session gesture).
         clearTouchGestureState()
+        // Modern wireless (9.2W-B1): the RFCOMM target is the device NAME from
+        // the typed request - bound to THIS attempt, never drifting.
+        val btTargetName = device?.name?.trim().orEmpty()
         probeReport = CarLifeProbeReport(
-            state = if (transport == CarLifeTransport.WIFI_AP) {
-                CarLifeProbeState.WIFI_WAITING_NETWORK
-            } else {
-                CarLifeProbeState.USB_DEVICE_FOUND
+            state = when (transport) {
+                CarLifeTransport.WIFI_AP -> CarLifeProbeState.WIFI_WAITING_NETWORK
+                CarLifeTransport.BT_HOTSPOT ->
+                    if (provider.hasBluetoothConnectPermission()) {
+                        CarLifeProbeState.BT_TARGET_REQUIRED
+                    } else {
+                        CarLifeProbeState.BT_WAITING_PERMISSION
+                    }
+                else -> CarLifeProbeState.USB_DEVICE_FOUND
             },
-            blocker = if (transport == CarLifeTransport.WIFI_AP) {
-                CarLifeBlocker.NO_DISCOVERY_PACKET
-            } else {
-                CarLifeBlocker.NO_REAL_DEVICE
+            blocker = when (transport) {
+                CarLifeTransport.WIFI_AP -> CarLifeBlocker.NO_DISCOVERY_PACKET
+                CarLifeTransport.BT_HOTSPOT -> CarLifeBlocker.BT_BOOTSTRAP_SILENT
+                else -> CarLifeBlocker.NO_REAL_DEVICE
             },
             session = token.value,
             ptsSource = CarLifeVideoFraming.PTS_SOURCE,
             transport = transport.name,
+            btTarget = btTargetName.ifEmpty { null },
         )
+        if (transport == CarLifeTransport.BT_HOTSPOT && btTargetName.isEmpty()) {
+            // Section 11: never auto-connect arbitrary paired devices.
+            failStartup(
+                token,
+                IllegalStateException(CarLifeBluetoothPermissions.REASON_BT_TARGET_NOT_SELECTED),
+                blocker = CarLifeBlocker.BT_TARGET_NOT_SELECTED,
+            )
+            return
+        }
         stateStore.publish(ProjectionState.Connecting)
         try {
             provider.startConnection(token, transport, ::onConnectionEvent)
@@ -286,13 +316,20 @@ class CarLifeProjectionBackend(
                     networkType = diag.networkType,
                 )
             }
-            probeReport = probeReport.copy(
-                state = if (transport == CarLifeTransport.WIFI_AP) {
-                    CarLifeProbeState.WIFI_WAITING_NETWORK
-                } else {
-                    CarLifeProbeState.AOA_SWITCH_REQUESTED
-                },
-            )
+            if (transport == CarLifeTransport.BT_HOTSPOT) {
+                // Modern wireless (9.2W-B1): the transport does NOT connect
+                // yet - the session-scoped RFCOMM bootstrap runs first and the
+                // TCP channel set opens only to the protocol-provided phone IP.
+                provider.startBluetoothBootstrap(token, btTargetName, ::onBootstrapEvent)
+            } else {
+                probeReport = probeReport.copy(
+                    state = if (transport == CarLifeTransport.WIFI_AP) {
+                        CarLifeProbeState.WIFI_WAITING_NETWORK
+                    } else {
+                        CarLifeProbeState.AOA_SWITCH_REQUESTED
+                    },
+                )
+            }
             armProbeTimeout(token)
         } catch (error: Exception) {
             // STARTUP FAILURE (9.2W-A.1): resources were already acquired by
@@ -309,7 +346,11 @@ class CarLifeProjectionBackend(
      * closes its video/touch paths, publishes Error and confirms the session
      * stopped so shared resource leases are released immediately.
      */
-    private fun failStartup(token: CarLifeSessionToken, error: Exception) {
+    private fun failStartup(
+        token: CarLifeSessionToken,
+        error: Exception,
+        blocker: CarLifeBlocker = CarLifeBlocker.OTHER,
+    ) {
         cancelProbeTimeout()
         connectPending = false
         isSessionActive = false
@@ -320,15 +361,15 @@ class CarLifeProjectionBackend(
         clearTouchGestureState()
         probeReport = probeReport.copy(
             state = CarLifeProbeState.ERROR,
-            blocker = CarLifeBlocker.OTHER,
-            lastError = error.javaClass.simpleName,
+            blocker = blocker,
+            lastError = error.message ?: error.javaClass.simpleName,
             decoderState = "stopped",
             touchState = "waiting",
             touchSurfaceWidth = null,
             touchSurfaceHeight = null,
         )
-        publishError(ProjectionErrorCode.CONNECT_FAILED, "CarLife connect failed: ${error.javaClass.simpleName}")
-        // Confirm stop -> ProjectionManager releases USB/WIFI + AUDIO now.
+        publishError(ProjectionErrorCode.CONNECT_FAILED, "CarLife connect failed: ${error.message ?: error.javaClass.simpleName}")
+        // Confirm stop -> ProjectionManager releases USB/WIFI/BLUETOOTH + AUDIO now.
         sessionStoppedListener?.run()
     }
 
@@ -501,13 +542,16 @@ class CarLifeProjectionBackend(
         when (event) {
             is CarLifeConnectionEvent.Attached -> {
                 cancelProbeTimeout()
-                // Transport-neutral attach (9.2W-A.1): only the AOA transport
-                // reports AOA; WIFI_AP reports WIFI_TRANSPORT_ATTACHED. The
-                // success criterion stays CONNECTION_ESTABLISHED.
-                probeReport = if (activeTransport == CarLifeTransport.WIFI_AP) {
-                    probeReport.copy(state = CarLifeProbeState.WIFI_TRANSPORT_ATTACHED, connectionState = 1)
-                } else {
-                    probeReport.copy(
+                // Transport-neutral attach (9.2W-A.1/9.2W-B1): only the AOA
+                // transport reports AOA; the wireless transports report their
+                // own attach state. The success criterion stays
+                // CONNECTION_ESTABLISHED.
+                probeReport = when (activeTransport) {
+                    CarLifeTransport.WIFI_AP ->
+                        probeReport.copy(state = CarLifeProbeState.WIFI_TRANSPORT_ATTACHED, connectionState = 1)
+                    CarLifeTransport.BT_HOTSPOT ->
+                        probeReport.copy(state = CarLifeProbeState.BT_TRANSPORT_ATTACHED, connectionState = 1)
+                    else -> probeReport.copy(
                         state = CarLifeProbeState.AOA_ATTACHED,
                         aoaState = "attached",
                         connectionState = 1,
@@ -523,10 +567,12 @@ class CarLifeProjectionBackend(
             }
             is CarLifeConnectionEvent.Reattached -> {
                 ensureVideoSink(current)
-                probeReport = if (activeTransport == CarLifeTransport.WIFI_AP) {
-                    probeReport.copy(state = CarLifeProbeState.WIFI_TRANSPORT_ATTACHED)
-                } else {
-                    probeReport.copy(state = CarLifeProbeState.AOA_ATTACHED, aoaState = "reattached")
+                probeReport = when (activeTransport) {
+                    CarLifeTransport.WIFI_AP ->
+                        probeReport.copy(state = CarLifeProbeState.WIFI_TRANSPORT_ATTACHED)
+                    CarLifeTransport.BT_HOTSPOT ->
+                        probeReport.copy(state = CarLifeProbeState.BT_TRANSPORT_ATTACHED)
+                    else -> probeReport.copy(state = CarLifeProbeState.AOA_ATTACHED, aoaState = "reattached")
                 }
                 stateStore.publish(ProjectionState.Connecting)
             }
@@ -594,6 +640,111 @@ class CarLifeProjectionBackend(
                 )
             }
         }
+    }
+
+    /**
+     * Modern wireless Bluetooth bootstrap events (Phase 9.2W-B1). Every event
+     * is token-fenced exactly like video/touch: a late RFCOMM callback of a
+     * dead attempt can never mutate the current session.
+     */
+    private fun onBootstrapEvent(event: CarLifeBootstrapEvent) {
+        val current = activeSession
+        if (current == null || event.session != current) {
+            probeReport = probeReport.copy(lastError = "stale-bt-callback-ignored:${event::class.simpleName}")
+            return
+        }
+        when (event) {
+            is CarLifeBootstrapEvent.Searching -> {
+                probeReport = probeReport.copy(
+                    state = CarLifeProbeState.BT_TARGET_REQUIRED,
+                    btTarget = event.targetName,
+                )
+            }
+            is CarLifeBootstrapEvent.TargetFound -> {
+                probeReport = probeReport.copy(
+                    state = CarLifeProbeState.BT_TARGET_FOUND,
+                    btTarget = event.targetName,
+                    btBonded = "yes",
+                )
+            }
+            is CarLifeBootstrapEvent.RfcommConnecting -> {
+                probeReport = probeReport.copy(
+                    state = CarLifeProbeState.BT_RFCOMM_CONNECTING,
+                    btRfcomm = "connecting",
+                )
+            }
+            is CarLifeBootstrapEvent.RfcommConnected -> {
+                probeReport = probeReport.copy(
+                    state = CarLifeProbeState.BT_RFCOMM_CONNECTED,
+                    btRfcomm = "connected",
+                )
+            }
+            is CarLifeBootstrapEvent.Message -> {
+                probeReport = when (event.kind) {
+                    "info-request" -> probeReport.copy(
+                        state = CarLifeProbeState.BT_WAITING_WIRELESS_INFO,
+                        btInfoRequest = true,
+                    )
+                    "info-response-sent" -> probeReport.copy(
+                        state = CarLifeProbeState.BT_WIRELESS_INFO_NEGOTIATED,
+                        btInfoResponse = true,
+                        btAdvertisedType = "HOTSPOT",
+                    )
+                    "target-info-request" -> probeReport.copy(
+                        state = CarLifeProbeState.BT_TARGET_INFO_REQUESTED,
+                        btTargetInfoRequest = true,
+                        // Observe only: this request belongs to the Wi-Fi
+                        // Direct path (Phase 9.2W-B2) - no P2P is started and
+                        // no target data is faked.
+                        modernWirelessPath = "WIFI_DIRECT_REQUIRED",
+                    )
+                    "response-ip" -> probeReport.copy(state = CarLifeProbeState.BT_WAITING_PHONE_IP)
+                    else -> probeReport
+                }
+            }
+            is CarLifeBootstrapEvent.WirelessIp -> {
+                probeReport = probeReport.copy(
+                    state = CarLifeProbeState.BT_PHONE_IP_RECEIVED,
+                    btResponseIpReceived = true,
+                    phoneIp = event.ip,
+                )
+                // The IP is PROTOCOL-PROVIDED (never guessed): continue to the
+                // existing TCP channel set.
+                if (!provider.connectWirelessToPhoneIp(event.session, event.ip)) {
+                    probeReport = probeReport.copy(lastError = "wireless-ip-send-rejected")
+                }
+            }
+            is CarLifeBootstrapEvent.Failed -> {
+                probeReport = probeReport.copy(
+                    lastError = event.reason,
+                    btBonded = if (event.reason == CarLifeBluetoothPermissions.REASON_BT_TARGET_NOT_BONDED) {
+                        "no"
+                    } else {
+                        probeReport.btBonded
+                    },
+                    btRfcomm = if (event.reason.startsWith("BT_RFCOMM")) "error" else probeReport.btRfcomm,
+                )
+                finishSession(
+                    CarLifeProbeState.ERROR,
+                    blocker = blockerForBootstrapReason(event.reason),
+                    errorCode = ProjectionErrorCode.TRANSPORT_ERROR,
+                    message = event.reason,
+                )
+            }
+        }
+    }
+
+    /** Section 35 classifications for the modern bootstrap failure reasons. */
+    private fun blockerForBootstrapReason(reason: String): CarLifeBlocker = when {
+        reason == CarLifeBluetoothPermissions.REASON_BT_PERMISSION -> CarLifeBlocker.BT_PERMISSION
+        reason == CarLifeBluetoothPermissions.REASON_BT_TARGET_NOT_SELECTED -> CarLifeBlocker.BT_TARGET_NOT_SELECTED
+        reason == CarLifeBluetoothPermissions.REASON_BT_TARGET_NOT_BONDED -> CarLifeBlocker.BT_TARGET_NOT_BONDED
+        reason.startsWith("BT_RFCOMM") -> CarLifeBlocker.BT_RFCOMM_CONNECT_FAILED
+        reason == CarLifeBluetoothPermissions.REASON_WIRELESS_INFO_NEGOTIATION_FAILED ->
+            CarLifeBlocker.WIRELESS_INFO_NEGOTIATION_FAILED
+        reason.startsWith("PHONE_IP") -> CarLifeBlocker.PHONE_IP_NOT_PROVIDED
+        reason.startsWith("TCP_CONNECT_FAILED") -> CarLifeBlocker.TCP_CONNECT_FAILED
+        else -> CarLifeBlocker.OTHER
     }
 
     /**
@@ -794,6 +945,16 @@ class CarLifeProjectionBackend(
             probeReport.localIp == null -> CarLifeBlocker.NO_NETWORK
             probeReport.phoneIp != null -> CarLifeBlocker.PHONE_DISCOVERED_TCP_FAILED
             else -> CarLifeBlocker.NO_DISCOVERY_PACKET
+        }
+        CarLifeTransport.BT_HOTSPOT -> when {
+            !probeReport.btPermission -> CarLifeBlocker.BT_PERMISSION
+            probeReport.modernWirelessPath == "WIFI_DIRECT_REQUIRED" -> CarLifeBlocker.WIFI_DIRECT_REQUIRED
+            probeReport.btBonded != "yes" -> CarLifeBlocker.BT_TARGET_NOT_BONDED
+            probeReport.btRfcomm != "connected" -> CarLifeBlocker.BT_RFCOMM_CONNECT_FAILED
+            !probeReport.btInfoRequest -> CarLifeBlocker.BT_BOOTSTRAP_SILENT
+            !probeReport.btInfoResponse -> CarLifeBlocker.WIRELESS_INFO_NEGOTIATION_FAILED
+            !probeReport.btResponseIpReceived -> CarLifeBlocker.PHONE_IP_NOT_PROVIDED
+            else -> CarLifeBlocker.TCP_CONNECT_FAILED
         }
         else -> if (probeReport.usbDevice != null) {
             CarLifeBlocker.AOA_COMPATIBILITY

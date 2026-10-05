@@ -80,6 +80,37 @@ interface CarLifeProvider {
      */
     fun sendTouch(token: CarLifeSessionToken, event: MotionEvent): Boolean = false
 
+    // ---- Modern wireless Bluetooth bootstrap (Phase 9.2W-B1) ----
+
+    /**
+     * Starts the session-scoped RFCOMM bootstrap of [token] toward the bonded
+     * device with EXACT name [targetBluetoothName] (never a random device,
+     * never a reflection fallback). Every [listener] event is permanently bound
+     * to [token]; a late Bluetooth callback of a dead attempt is rejected by
+     * identity. No Wi-Fi Direct machinery is started by this call.
+     */
+    fun startBluetoothBootstrap(
+        token: CarLifeSessionToken,
+        targetBluetoothName: String,
+        listener: (CarLifeBootstrapEvent) -> Unit,
+    ) {}
+
+    /** Stops/fences the bootstrap of [token] (idempotent). */
+    fun stopBluetoothBootstrap(token: CarLifeSessionToken) {}
+
+    /**
+     * Continues the wireless transport to a PROTOCOL-PROVIDED phone IP: the
+     * TCP channel set opens directly (no UDP discovery). Returns true only for
+     * the current armed attempt.
+     */
+    fun connectWirelessToPhoneIp(token: CarLifeSessionToken, ip: String): Boolean = false
+
+    /** Bonded Bluetooth device NAMES only (no MAC/address); empty when unknown. */
+    fun listBondedBluetoothNames(): List<String> = emptyList()
+
+    /** False when the BLUETOOTH_CONNECT runtime grant is missing (API 31+). */
+    fun hasBluetoothConnectPermission(): Boolean = true
+
     fun dispose()
 
     /**
@@ -118,7 +149,71 @@ data class CarLifeProviderDiagnostics(
     val tcpChannels: Map<String, String> = emptyMap(),
     /** True once the TCP channel set attached (protocol may now run). */
     val transportAttached: Boolean = false,
+    // ---- Modern Bluetooth bootstrap diagnostics (Phase 9.2W-B1) ----
+    /** BLUETOOTH_CONNECT granted (API 31+); always true on older platforms. */
+    val btPermission: Boolean = true,
+    /** Selected target device NAME only (never a MAC/address). */
+    val btTarget: String? = null,
+    val btBonded: String? = null,
+    /** idle / connecting / connected / error. */
+    val btRfcomm: String = "idle",
+    val btInfoRequest: Boolean = false,
+    val btInfoResponse: Boolean = false,
+    /** Exactly what B1 advertises: HOTSPOT (TYPE_WIFI). */
+    val btAdvertisedType: String? = null,
+    val btTargetInfoRequest: Boolean = false,
+    /** Always false in B1: MSG_WIRELESS_REQUEST_IP is never sent speculatively. */
+    val btRequestIpSent: Boolean = false,
+    val btResponseIpReceived: Boolean = false,
+    /** WIFI_DIRECT_REQUIRED when the phone's messages require the P2P path. */
+    val modernWirelessPath: String? = null,
 )
+
+/**
+ * Modern-wireless Bluetooth bootstrap events (Phase 9.2W-B1), permanently
+ * bound to the [CarLifeSessionToken] of the attempt that started the
+ * bootstrap. Late events of a dead attempt are rejected by identity - a
+ * bootstrap callback is NEVER relabelled with a newer token.
+ */
+sealed class CarLifeBootstrapEvent {
+    abstract val session: CarLifeSessionToken
+
+    data class Searching(
+        override val session: CarLifeSessionToken,
+        val targetName: String,
+    ) : CarLifeBootstrapEvent()
+
+    data class TargetFound(
+        override val session: CarLifeSessionToken,
+        val targetName: String,
+    ) : CarLifeBootstrapEvent()
+
+    data class RfcommConnecting(
+        override val session: CarLifeSessionToken,
+        val targetName: String,
+    ) : CarLifeBootstrapEvent()
+
+    data class RfcommConnected(
+        override val session: CarLifeSessionToken,
+        val targetName: String,
+    ) : CarLifeBootstrapEvent()
+
+    /** kind: "info-request" / "info-response-sent" / "target-info-request" / "response-ip" / "md-status" / "other". */
+    data class Message(
+        override val session: CarLifeSessionToken,
+        val kind: String,
+    ) : CarLifeBootstrapEvent()
+
+    data class WirelessIp(
+        override val session: CarLifeSessionToken,
+        val ip: String,
+    ) : CarLifeBootstrapEvent()
+
+    data class Failed(
+        override val session: CarLifeSessionToken,
+        val reason: String,
+    ) : CarLifeBootstrapEvent()
+}
 
 /**
  * Configuration of one CarLife provider instance.

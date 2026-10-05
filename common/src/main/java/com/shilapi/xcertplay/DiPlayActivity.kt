@@ -612,9 +612,14 @@ class DiPlayActivity : ComponentActivity() {
     private var carLifeBackendRef: com.shilapi.xcertplay.carlife.CarLifeProjectionBackend? = null
     private var carLifeSessionLaunched = false
     private var carLifeProbeStatus: TextView? = null
+    private var carLifeBtTargetName: String? = null
+    private var carLifeBtStartPending = false
+
+    /** Android 12+ BLUETOOTH_CONNECT runtime request (section 8). */
+    private val requestBtPermission = 7401
 
     private fun carLifePanel(content: LinearLayout) {
-        section(content, "Android CarLife — USB AOA / Wireless AP Probe") { card ->
+        section(content, "Android CarLife — USB / Wireless AP / Bluetooth Hotspot") { card ->
             if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0) {
                 // Release builds never expose the developer probe.
                 card.addView(TextView(this).apply { this.text = "CarLife probe is available in debug builds only." })
@@ -630,8 +635,14 @@ class DiPlayActivity : ComponentActivity() {
             card.addView(button("Developer: CarLife USB Probe — start", false) {
                 startCarLifeProbe(com.shilapi.xcertplay.projection.ProjectionTransport.USB)
             }, matchButton(10, 60))
-            card.addView(button("Developer: CarLife Wireless AP — start", false) {
+            card.addView(button("Developer: CarLife Wireless — Legacy AP — start", false) {
                 startCarLifeProbe(com.shilapi.xcertplay.projection.ProjectionTransport.WIFI)
+            }, matchButton(10, 60))
+            card.addView(button("Developer: select Bluetooth target (names only)", false) {
+                pickCarLifeBtTarget()
+            }, matchButton(10, 60))
+            card.addView(button("Developer: CarLife Modern Wireless — Bluetooth + Phone Hotspot", false) {
+                startCarLifeProbe(com.shilapi.xcertplay.projection.ProjectionTransport.BLUETOOTH)
             }, matchButton(10, 60))
             card.addView(button("Developer: CarLife probe — disconnect", false) {
                 ProjectionHost.manager.disconnectBackend(com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID)
@@ -642,14 +653,62 @@ class DiPlayActivity : ComponentActivity() {
     }
 
     /**
+     * Debug picker of BONDED Bluetooth device NAMES (section 11: never a MAC
+     * address / address / serial). The selected name is bound to the next
+     * modern-wireless attempt as its exact RFCOMM target.
+     */
+    private fun pickCarLifeBtTarget() {
+        try {
+            val provider = carLifeProvider ?: com.shilapi.xcertplay.carlife.CarLifeV2Provider().also {
+                it.initialize(
+                    applicationContext,
+                    com.shilapi.xcertplay.carlife.CarLifeProviderConfig(activityClass = DiPlayActivity::class.java),
+                )
+                carLifeProvider = it
+            }
+            val names = provider.listBondedBluetoothNames()
+            if (names.isEmpty()) {
+                toast("No bonded Bluetooth devices")
+                return
+            }
+            AlertDialog.Builder(this)
+                .setTitle("CarLife Bluetooth target (names only)")
+                .setItems(names.toTypedArray()) { _, which ->
+                    carLifeBtTargetName = names[which]
+                    refreshCarLifeProbe()
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        } catch (error: Exception) {
+            toast("Bluetooth list failed: ${error.javaClass.simpleName}")
+        }
+    }
+
+    /**
      * Debug-only probe: initializes the open CarLife V2 provider with the
      * PUBLIC demo configuration (DEMO_CHANNEL — NOT FOR PRODUCTION —
      * COMPATIBILITY UNVERIFIED) and starts one connect attempt over the
-     * requested transport (USB AOA or Wireless AP / same LAN). Only one CarLife
-     * attempt may be active at a time - the backend rejects mixed transports.
+     * requested transport (USB AOA, legacy Wireless AP, or modern Bluetooth +
+     * phone hotspot). Only one CarLife attempt may be active at a time - the
+     * backend rejects mixed transports.
      */
     private fun startCarLifeProbe(transport: com.shilapi.xcertplay.projection.ProjectionTransport) {
         try {
+            if (transport == com.shilapi.xcertplay.projection.ProjectionTransport.BLUETOOTH) {
+                // Section 8/32: explicit runtime permission flow on Android 12+.
+                if (com.shilapi.xcertplay.carlife.CarLifeBluetoothPermissions.needsRuntimeGrant(Build.VERSION.SDK_INT) &&
+                    checkSelfPermission("android.permission.BLUETOOTH_CONNECT") !=
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    carLifeBtStartPending = true
+                    requestPermissions(arrayOf("android.permission.BLUETOOTH_CONNECT"), requestBtPermission)
+                    return
+                }
+                if (carLifeBtTargetName.isNullOrEmpty()) {
+                    toast("Select a Bluetooth target first")
+                    return
+                }
+            }
             // ONE provider / ONE CarLife.init / ONE backend registration per
             // process. Start Probe reuses them — never new/re-init.
             val provider = carLifeProvider ?: com.shilapi.xcertplay.carlife.CarLifeV2Provider().also {
@@ -668,14 +727,17 @@ class DiPlayActivity : ComponentActivity() {
                 carLifeBackendRef = it
                 ProjectionHost.manager.register(it)
             }
+            val deviceName = when (transport) {
+                com.shilapi.xcertplay.projection.ProjectionTransport.BLUETOOTH -> carLifeBtTargetName!!
+                com.shilapi.xcertplay.projection.ProjectionTransport.USB -> "Android phone (CarLife USB)"
+                else -> "Android phone (CarLife Wireless AP)"
+            }
             ProjectionHost.manager.connect(
                 com.shilapi.xcertplay.projection.ProjectionDevice(
                     id = "carlife-phone",
-                    name = if (transport == com.shilapi.xcertplay.projection.ProjectionTransport.USB) {
-                        "Android phone (CarLife USB)"
-                    } else {
-                        "Android phone (CarLife Wireless AP)"
-                    },
+                    // For BT_HOTSPOT this NAME is the deterministic RFCOMM
+                    // target (exact bonded-device match) - bound to the attempt.
+                    name = deviceName,
                     backendId = com.shilapi.xcertplay.carlife.CarLifeProjectionBackend.ID,
                     transport = transport,
                 ),
@@ -686,6 +748,25 @@ class DiPlayActivity : ComponentActivity() {
             toast("CarLife probe failed: ${error.javaClass.simpleName}")
         }
         refreshCarLifeProbe()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == requestBtPermission && carLifeBtStartPending) {
+            carLifeBtStartPending = false
+            if (grantResults.isNotEmpty() &&
+                grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                startCarLifeProbe(com.shilapi.xcertplay.projection.ProjectionTransport.BLUETOOTH)
+            } else {
+                toast("BLUETOOTH_CONNECT denied — modern wireless unavailable")
+                refreshCarLifeProbe()
+            }
+        }
     }
 
     /** Renders protocol diagnostics only — never user content or secrets. */
@@ -703,6 +784,8 @@ class DiPlayActivity : ComponentActivity() {
             appendLine("USB: ${report.usbDevice ?: "-"}   AOA: ${report.aoaState}")
             appendLine("wireless: udp=${report.udpPort ?: "-"} listening=${report.udpListening} packets=${report.udpPacketsReceived} phone=${report.phoneIp ?: "-"}")
             appendLine("tcp: cmd=${report.tcpCmd ?: "-"} video=${report.tcpVideo ?: "-"} audio=${report.tcpAudio ?: "-"} tts=${report.tcpTts ?: "-"} vr=${report.tcpVr ?: "-"} touch=${report.tcpTouch ?: "-"} update=${report.tcpUpdate ?: "-"} attached=${report.transportAttached}")
+            appendLine("Bluetooth: permission=${if (report.btPermission) "yes" else "no"} target=${report.btTarget ?: "-"} bonded=${report.btBonded ?: "-"} rfcomm=${report.btRfcomm}")
+            appendLine("bootstrap: infoRequest=${report.btInfoRequest} infoResponse=${report.btInfoResponse} advertisedType=${report.btAdvertisedType ?: "-"} targetInfoRequest=${report.btTargetInfoRequest} requestIpSent=${report.btRequestIpSent} responseIpReceived=${report.btResponseIpReceived} path=${report.modernWirelessPath ?: "-"}")
             appendLine("connection: ${report.connectionState}  protocolVersion: ${report.protocolVersion ?: "-"}")
             appendLine("phone CarLife protocol version: ${report.phoneCarlifeProtocolVersion ?: "0 (not reported)"}   auth: ${report.authResult ?: "-"}")
             appendLine("last error: ${report.lastError ?: "-"}")

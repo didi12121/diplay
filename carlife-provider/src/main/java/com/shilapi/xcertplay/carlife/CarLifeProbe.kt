@@ -65,6 +65,32 @@ enum class CarLifeProbeState {
     /** TCP channel set attached; the protocol layer may now run. */
     WIFI_TRANSPORT_ATTACHED,
 
+    // ---- Modern Bluetooth bootstrap stages (Phase 9.2W-B1) ----
+    /** Waiting for the BLUETOOTH_CONNECT runtime grant (Android 12+). */
+    BT_WAITING_PERMISSION,
+    /** No target Bluetooth device selected yet (BT_TARGET_NOT_SELECTED). */
+    BT_TARGET_REQUIRED,
+    /** The selected target matched a BONDED device by exact name. */
+    BT_TARGET_FOUND,
+    /** RFCOMM (SPP UUID) connect in flight. */
+    BT_RFCOMM_CONNECTING,
+    /** RFCOMM channel established; waiting for the phone's first message. */
+    BT_RFCOMM_CONNECTED,
+    /** RFCOMM up; waiting for MSG_WIRELESS_INFO_REQUEST. */
+    BT_WAITING_WIRELESS_INFO,
+    /** MSG_WIRELESS_INFO_REQUEST answered with TYPE_WIFI (hotspot only). */
+    BT_WIRELESS_INFO_NEGOTIATED,
+    /** Phone asked for Wi-Fi Direct target info (observed, NOT answered). */
+    BT_TARGET_INFO_REQUESTED,
+    /** Waiting for MSG_WIRELESS_RESPONSE_IP from the phone. */
+    BT_WAITING_PHONE_IP,
+    /** Protocol-provided phone IP received and validated. */
+    BT_PHONE_IP_RECEIVED,
+    /** TCP channel set to the phone IP is being opened. */
+    BT_TCP_CONNECTING,
+    /** BT hotspot transport attached (protocol may now run). */
+    BT_TRANSPORT_ATTACHED,
+
     /** Unexpected transport or SDK failure. */
     ERROR,
 }
@@ -98,6 +124,26 @@ enum class CarLifeBlocker {
 
     /** Phone discovered (IP known) but the TCP channel set failed to attach. */
     PHONE_DISCOVERED_TCP_FAILED,
+
+    // ---- Modern Bluetooth bootstrap blockers (Phase 9.2W-B1, section 35) ----
+    /** BLUETOOTH_CONNECT runtime permission missing/denied. */
+    BT_PERMISSION,
+    /** No target Bluetooth device was selected. */
+    BT_TARGET_NOT_SELECTED,
+    /** The selected target is not a bonded device with that exact name. */
+    BT_TARGET_NOT_BONDED,
+    /** RFCOMM (SPP UUID) connect to the target failed. */
+    BT_RFCOMM_CONNECT_FAILED,
+    /** RFCOMM connected but the phone sent no bootstrap messages. */
+    BT_BOOTSTRAP_SILENT,
+    /** Wireless info negotiation did not complete. */
+    WIRELESS_INFO_NEGOTIATION_FAILED,
+    /** The phone's messages clearly require the Wi-Fi Direct path (B2). */
+    WIFI_DIRECT_REQUIRED,
+    /** Bootstrap ran but the phone never provided an IP. */
+    PHONE_IP_NOT_PROVIDED,
+    /** Phone IP known but the TCP channel set failed (bounded connect). */
+    TCP_CONNECT_FAILED,
 
     /** Anything else (transport crash, SDK exception...). */
     OTHER,
@@ -195,6 +241,25 @@ data class CarLifeProbeReport(
     val tcpUpdate: String? = null,
     /** True once the TCP channel set attached (protocol may now run). */
     val transportAttached: Boolean = false,
+    // ---- Modern Bluetooth bootstrap diagnostics (Phase 9.2W-B1) ----
+    /** BLUETOOTH_CONNECT granted (Android 12+); true on older platforms. */
+    val btPermission: Boolean = true,
+    /** Selected target device NAME only (never a MAC/address). */
+    val btTarget: String? = null,
+    /** "yes" when the target matched a bonded device by exact name. */
+    val btBonded: String? = null,
+    /** idle / connecting / connected / error. */
+    val btRfcomm: String = "idle",
+    val btInfoRequest: Boolean = false,
+    val btInfoResponse: Boolean = false,
+    /** Exactly what B1 advertises: HOTSPOT (TYPE_WIFI) - never WIFI_DIRECT. */
+    val btAdvertisedType: String? = null,
+    val btTargetInfoRequest: Boolean = false,
+    /** Always false in B1: MSG_WIRELESS_REQUEST_IP is never sent speculatively. */
+    val btRequestIpSent: Boolean = false,
+    val btResponseIpReceived: Boolean = false,
+    /** Set to WIFI_DIRECT_REQUIRED when the phone asks for P2P target info. */
+    val modernWirelessPath: String? = null,
 )
 
 /**

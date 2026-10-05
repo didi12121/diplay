@@ -91,4 +91,11 @@ interface CarLifeReceiver: CarLifeContext {
      * transport progress probe. Never affects the protocol path.
      */
     fun setTransportProbeListener(listener: com.baidu.carlife.sdk.receiver.transport.wirless.WirlessTransportProbe?) {}
+
+    /**
+     * DiPlay host-local extension (Phase 9.2W-B1): binds the PROTOCOL-PROVIDED
+     * phone IP (from the Bluetooth bootstrap) so the next [connect] opens the
+     * TCP channel set directly (no UDP 7999 discovery). Never guesses an IP.
+     */
+    fun setWirelessPhoneIp(ip: String) {}
 }

@@ -62,8 +62,13 @@ class CarLifeTransportModelTest {
     }
 
     @Test
-    fun bluetoothHasNoCarLifeTransport() {
-        assertNull(CarLifeTransport.forDevice(device(ProjectionTransport.BLUETOOTH)))
+    fun bluetoothRequestResolvesToBtHotspot() {
+        // Phase 9.2W-B1 contract change (was rejected in 9.2W-A): a BLUETOOTH
+        // request is the modern Bluetooth + phone-hotspot bootstrap.
+        assertEquals(
+            CarLifeTransport.BT_HOTSPOT,
+            CarLifeTransport.forDevice(device(ProjectionTransport.BLUETOOTH)),
+        )
     }
 
     // ---- Transport-scoped resources (section 25) ----

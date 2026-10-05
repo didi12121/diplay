@@ -9,6 +9,7 @@ import com.baidu.carlife.sdk.ConnectionChangeListener
 import com.baidu.carlife.sdk.receiver.CarLife
 import com.baidu.carlife.sdk.receiver.CarLifeReceiver
 import com.baidu.carlife.sdk.receiver.ConnectProgressListener
+import com.baidu.carlife.sdk.receiver.transport.instant.CarLifeWirelessBootstrap
 import com.baidu.carlife.sdk.receiver.transport.wirless.WirlessTransportProbe
 
 /**
@@ -50,6 +51,25 @@ interface CarLifeReceiverFacade {
     fun configureConnectTypeWithoutStarting(type: Int) {}
     /** Diagnostics-only wireless transport probe (host-local). */
     fun setTransportProbeListener(listener: WirlessTransportProbe?) {}
+
+    // ---- Modern wireless Bluetooth bootstrap (Phase 9.2W-B1) ----
+    /** Bonded Bluetooth device NAMES only (never MAC/address). */
+    fun listBondedBluetoothNames(): List<String> = emptyList()
+    /** False when the BLUETOOTH_CONNECT runtime grant is missing (API 31+). */
+    fun hasBluetoothConnectPermission(): Boolean = true
+    /**
+     * Session-scoped RFCOMM bootstrap (host-local seam, see
+     * [CarLifeWirelessBootstrap]). The returned handle terminates everything.
+     */
+    fun startBluetoothBootstrap(
+        targetName: String,
+        listener: CarLifeWirelessBootstrap.Listener,
+    ): AutoCloseable = AutoCloseable {}
+    /**
+     * Continues the wireless transport to a PROTOCOL-PROVIDED phone IP (TCP
+     * channel set directly - no UDP discovery).
+     */
+    fun connectWirelessToPhoneIp(ip: String) {}
 }
 
 /**
@@ -138,6 +158,13 @@ class CarLifeV2Provider(
         /** Wireless transport diagnostics of THIS attempt (Phase 9.2W-A). */
         val wireless = WirelessState()
 
+        /** Modern Bluetooth bootstrap diagnostics of THIS attempt (9.2W-B1). */
+        val bt = BtState()
+
+        /** Session-scoped RFCOMM bootstrap handle (closed with the attempt). */
+        @Volatile
+        var bootstrap: AutoCloseable? = null
+
         fun emit(event: CarLifeConnectionEvent) {
             if (!armed) return // registration replay or pre-connect leftover
             sink(event) // event carries THIS attempt's fixed token
@@ -152,6 +179,19 @@ class CarLifeV2Provider(
         @Volatile var udpPackets = 0
         @Volatile var transportAttached = false
         val tcpChannels = java.util.concurrent.ConcurrentHashMap<Int, String>()
+    }
+
+    /** Modern Bluetooth bootstrap state (per attempt; names only, no MAC). */
+    private class BtState {
+        @Volatile var target: String? = null
+        @Volatile var bonded: String? = null
+        @Volatile var rfcomm = "idle"
+        @Volatile var infoRequest = false
+        @Volatile var infoResponse = false
+        @Volatile var advertisedType: String? = null
+        @Volatile var targetInfoRequest = false
+        @Volatile var responseIpReceived = false
+        @Volatile var modernWirelessPath: String? = null
     }
 
     override fun initialize(context: Context, config: CarLifeProviderConfig) {
@@ -183,6 +223,7 @@ class CarLifeV2Provider(
             runCatching { facade.removeConnectionListener(old.listener) }
             runCatching { facade.removeProgressListener(old.progress) }
             runCatching { facade.setTransportProbeListener(null) }
+            closeBootstrap(old) // RFCOMM bootstrap dies with its attempt
             detachVideo(old.token)
             // 2. fence the old transport: tear its attempt down AND suppress
             //    the detach auto-reconnect so it can never come back.
@@ -222,7 +263,13 @@ class CarLifeV2Provider(
         // synchronous UDP bind -> onUdpListening) belong to THIS attempt, while
         // registration replay stays fenced by the pre-arming window. ----
         current.armed = true
-        facade.connect()
+        if (transport != CarLifeTransport.BT_HOTSPOT) {
+            facade.connect()
+        }
+        // BT_HOTSPOT (9.2W-B1): the RFCOMM bootstrap runs first
+        // (startBluetoothBootstrap); the transport connects ONLY to the
+        // protocol-provided phone IP (connectWirelessToPhoneIp) - never a
+        // guessed address, never UDP 7999.
     }
 
     override fun stopConnection(token: CarLifeSessionToken) {
@@ -234,6 +281,7 @@ class CarLifeV2Provider(
         runCatching { facade.removeConnectionListener(current.listener) }
         runCatching { facade.removeProgressListener(current.progress) }
         runCatching { facade.setTransportProbeListener(null) }
+        closeBootstrap(current)
         runCatching { facade.shutdown() }
     }
 
@@ -241,6 +289,7 @@ class CarLifeV2Provider(
         val facade = facade ?: return CarLifeProviderDiagnostics()
         val current = synchronized(lock) { attempt }
         val wireless = current?.wireless
+        val bt = current?.bt
         return CarLifeProviderDiagnostics(
             usbDevices = runCatching { facade.usbDeviceSummaries() }.getOrDefault(emptyList()),
             localProtocolVersion = runCatching { facade.protocolVersion() }.getOrNull(),
@@ -257,6 +306,18 @@ class CarLifeV2Provider(
             tcpChannels = wireless?.tcpChannels?.entries
                 ?.associate { channelName(it.key) to it.value } ?: emptyMap(),
             transportAttached = wireless?.transportAttached ?: false,
+            // ---- Modern Bluetooth bootstrap (9.2W-B1; names only, no MAC) ----
+            btPermission = runCatching { hasBluetoothConnectPermission() }.getOrDefault(false),
+            btTarget = bt?.target,
+            btBonded = bt?.bonded,
+            btRfcomm = bt?.rfcomm ?: "idle",
+            btInfoRequest = bt?.infoRequest ?: false,
+            btInfoResponse = bt?.infoResponse ?: false,
+            btAdvertisedType = bt?.advertisedType,
+            btTargetInfoRequest = bt?.targetInfoRequest ?: false,
+            btRequestIpSent = false, // B1 never sends MSG_WIRELESS_REQUEST_IP
+            btResponseIpReceived = bt?.responseIpReceived ?: false,
+            modernWirelessPath = bt?.modernWirelessPath,
         )
     }
 
@@ -353,6 +414,142 @@ class CarLifeV2Provider(
         current.pushedSurfaceHeight = height
     }
 
+    // ---- Modern wireless Bluetooth bootstrap (Phase 9.2W-B1) ----
+
+    override fun listBondedBluetoothNames(): List<String> =
+        runCatching { facade?.listBondedBluetoothNames() ?: emptyList() }.getOrDefault(emptyList())
+
+    override fun hasBluetoothConnectPermission(): Boolean =
+        runCatching { facade?.hasBluetoothConnectPermission() ?: true }.getOrDefault(false)
+
+    override fun startBluetoothBootstrap(
+        token: CarLifeSessionToken,
+        targetBluetoothName: String,
+        listener: (CarLifeBootstrapEvent) -> Unit,
+    ) {
+        val facade = facade ?: return
+        val current = armedAttempt(token) ?: return // stale token: rejected
+        current.bt.target = targetBluetoothName
+        val handle = try {
+            facade.startBluetoothBootstrap(
+                targetBluetoothName,
+                bootstrapListenerFor(current, token, listener),
+            )
+        } catch (error: Exception) {
+            listener(CarLifeBootstrapEvent.Failed(token, error.javaClass.simpleName))
+            return
+        }
+        synchronized(lock) {
+            if (this.attempt !== current) {
+                // Superseded while starting: never leak a live bootstrap.
+                runCatching { handle.close() }
+                return
+            }
+            current.bootstrap = handle
+        }
+    }
+
+    override fun stopBluetoothBootstrap(token: CarLifeSessionToken) {
+        val current = synchronized(lock) {
+            if (attempt?.token != token) return
+            attempt ?: return
+        }
+        closeBootstrap(current)
+    }
+
+    override fun connectWirelessToPhoneIp(token: CarLifeSessionToken, ip: String): Boolean {
+        val facade = facade ?: return false
+        val current = armedAttempt(token) ?: return false // stale token: rejected
+        current.wireless.phoneIp = ip
+        return runCatching {
+            facade.connectWirelessToPhoneIp(ip)
+            true
+        }.getOrDefault(false)
+    }
+
+    /** Closes + clears one attempt's bootstrap handle (idempotent). */
+    private fun closeBootstrap(current: Attempt) {
+        val handle = synchronized(lock) {
+            current.bootstrap.also { current.bootstrap = null }
+        }
+        runCatching { handle?.close() }
+    }
+
+    /**
+     * Bluetooth bootstrap callbacks bound PERMANENTLY to one attempt
+     * (9.2W-B1): a late RFCOMM callback of a dead/superseded attempt can never
+     * mutate the current attempt or be relabelled with a newer token.
+     */
+    private fun bootstrapListenerFor(
+        attempt: Attempt,
+        token: CarLifeSessionToken,
+        sink: (CarLifeBootstrapEvent) -> Unit,
+    ): CarLifeWirelessBootstrap.Listener = object : CarLifeWirelessBootstrap.Listener {
+        private fun live(): Boolean =
+            synchronized(lock) { this@CarLifeV2Provider.attempt }?.let { it === attempt && it.armed } == true
+
+        private fun emit(event: CarLifeBootstrapEvent) {
+            if (!live()) return
+            sink(event)
+        }
+
+        override fun onBluetoothSearching(targetName: String) {
+            emit(CarLifeBootstrapEvent.Searching(token, targetName))
+        }
+
+        override fun onBluetoothTargetFound(targetName: String) {
+            if (!live()) return
+            attempt.bt.bonded = "yes"
+            sink(CarLifeBootstrapEvent.TargetFound(token, targetName))
+        }
+
+        override fun onBluetoothRfcommConnecting(targetName: String) {
+            if (!live()) return
+            attempt.bt.rfcomm = "connecting"
+            sink(CarLifeBootstrapEvent.RfcommConnecting(token, targetName))
+        }
+
+        override fun onBluetoothRfcommConnected(targetName: String) {
+            if (!live()) return
+            attempt.bt.rfcomm = "connected"
+            sink(CarLifeBootstrapEvent.RfcommConnected(token, targetName))
+        }
+
+        override fun onBootstrapMessage(kind: String) {
+            if (!live()) return
+            when (kind) {
+                "info-request" -> attempt.bt.infoRequest = true
+                "info-response-sent" -> {
+                    attempt.bt.infoResponse = true
+                    attempt.bt.advertisedType = "HOTSPOT"
+                }
+                "target-info-request" -> {
+                    // Observe only: this request belongs to the Wi-Fi Direct
+                    // path (Phase 9.2W-B2). Never fake data, never start P2P.
+                    attempt.bt.targetInfoRequest = true
+                    attempt.bt.modernWirelessPath = "WIFI_DIRECT_REQUIRED"
+                }
+                "response-ip" -> Unit // the IP verdict arrives via onWirelessIp
+            }
+            sink(CarLifeBootstrapEvent.Message(token, kind))
+        }
+
+        override fun onWirelessIp(ip: String) {
+            if (!live()) return
+            attempt.bt.responseIpReceived = true
+            attempt.wireless.phoneIp = ip
+            sink(CarLifeBootstrapEvent.WirelessIp(token, ip))
+        }
+
+        override fun onBootstrapFailed(reason: String) {
+            if (!live()) return
+            if (reason == "BT_TARGET_NOT_BONDED") attempt.bt.bonded = "no"
+            if (reason.startsWith("BT_PERMISSION")) attempt.bt.bonded = "no"
+            if (reason.startsWith("BT_RFCOMM")) attempt.bt.rfcomm = "error"
+            sink(CarLifeBootstrapEvent.Failed(token, reason))
+        }
+    }
+
     override fun dispose() {
         videoBridges.keys.toList().forEach { detachVideo(it) }
         val facade = facade ?: return
@@ -360,6 +557,7 @@ class CarLifeV2Provider(
         if (current != null) {
             runCatching { facade.removeConnectionListener(current.listener) }
             runCatching { facade.removeProgressListener(current.progress) }
+            closeBootstrap(current)
         }
         runCatching { facade.setTransportProbeListener(null) }
         runCatching { facade.shutdown() }
@@ -437,7 +635,13 @@ class CarLifeV2Provider(
         override fun onTcpConnecting(host: String) {
             if (!live()) return
             attempt.wireless.phoneIp = host
-            stage(CarLifeProbeState.WIFI_TCP_CONNECTING)
+            stage(
+                if (attempt.transport == CarLifeTransport.BT_HOTSPOT) {
+                    CarLifeProbeState.BT_TCP_CONNECTING
+                } else {
+                    CarLifeProbeState.WIFI_TCP_CONNECTING
+                },
+            )
         }
 
         override fun onTcpChannelState(channel: Int, port: Int, state: String, error: String?) {
@@ -449,7 +653,13 @@ class CarLifeV2Provider(
             if (!live()) return
             attempt.wireless.phoneIp = host
             attempt.wireless.transportAttached = true
-            stage(CarLifeProbeState.WIFI_TRANSPORT_ATTACHED)
+            stage(
+                if (attempt.transport == CarLifeTransport.BT_HOTSPOT) {
+                    CarLifeProbeState.BT_TRANSPORT_ATTACHED
+                } else {
+                    CarLifeProbeState.WIFI_TRANSPORT_ATTACHED
+                },
+            )
         }
 
         override fun onTransportError(error: String) {
@@ -542,6 +752,37 @@ class CarLifeV2Provider(
 
         override fun setTransportProbeListener(listener: WirlessTransportProbe?) =
             receiver.setTransportProbeListener(listener)
+
+        override fun listBondedBluetoothNames(): List<String> = runCatching {
+            val manager = appContext.getSystemService(Context.BLUETOOTH_SERVICE)
+                as? android.bluetooth.BluetoothManager
+            manager?.adapter?.bondedDevices
+                ?.mapNotNull { it.name }
+                ?.sorted()
+                ?: emptyList()
+        }.getOrDefault(emptyList())
+
+        override fun hasBluetoothConnectPermission(): Boolean =
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                appContext.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            } else {
+                true // legacy install-time BLUETOOTH permission
+            }
+
+        override fun startBluetoothBootstrap(
+            targetName: String,
+            listener: CarLifeWirelessBootstrap.Listener,
+        ): AutoCloseable {
+            val bootstrap = CarLifeWirelessBootstrap(receiver, targetName, listener)
+            bootstrap.start()
+            return AutoCloseable { bootstrap.terminate() }
+        }
+
+        override fun connectWirelessToPhoneIp(ip: String) {
+            receiver.setWirelessPhoneIp(ip)
+            receiver.connect()
+        }
 
         override fun usbDeviceSummaries(): List<String> {
             // VID:PID only — never serial numbers or other identifying data.

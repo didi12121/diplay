@@ -28,6 +28,15 @@ class WirlessAPProtocolTransport(
     @Volatile
     private var probe: WirlessTransportProbe? = probe
 
+    /**
+     * DiPlay host-local extension (Phase 9.2W-B1): when set, [connect] opens
+     * the TCP channel set DIRECTLY to this protocol-provided phone IP (BT
+     * hotspot mode) and never binds UDP 7999 / runs discovery. When null the
+     * legacy UDP discovery path is unchanged.
+     */
+    @Volatile
+    var phoneIp: String? = null
+
     /** DiPlay (9.2W-A.1): (re)binds the diagnostics probe of the live session. */
     fun setProbeListener(listener: WirlessTransportProbe?) {
         probe = listener
@@ -46,6 +55,27 @@ class WirlessAPProtocolTransport(
     }
 
     override fun connect() {
+        // ---- BT hotspot mode (9.2W-B1): the phone IP came from the Bluetooth
+        // bootstrap - open the TCP channel set directly, WITHOUT UDP 7999. ----
+        val knownIp = phoneIp
+        if (knownIp != null) {
+            d(Constants.TAG, "WirlessProtocolTransport connect to protocol phone ip")
+            Thread({
+                try {
+                    probe?.onTcpConnecting(knownIp)
+                    if (mWirlessConnector.startConnect(knownIp)) {
+                        probe?.onTransportAttached(knownIp)
+                        onConnectionAttached()
+                    } else {
+                        probe?.onTransportError("TCP_CONNECT_FAILED:channel-set")
+                    }
+                } catch (e: Exception) {
+                    d(Constants.TAG, "direct tcp connect error:", e)
+                    probe?.onTransportError("TCP_CONNECT_FAILED:${e.javaClass.simpleName}")
+                }
+            }, "CarLifeBtHotspotTcp").start()
+            return
+        }
         try {
             d(Constants.TAG, "WirlessProtocolTransport connect listener")
             if (mSocket == null) {

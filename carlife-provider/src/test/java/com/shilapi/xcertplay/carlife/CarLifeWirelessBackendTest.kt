@@ -165,15 +165,20 @@ class CarLifeWirelessBackendTest {
     }
 
     @Test
-    fun bluetoothRequestIsRejected() {
+    fun bluetoothRequestStartsBtHotspotAttempt() {
+        // Phase 9.2W-B1 contract change (was rejected in 9.2W-A): BLUETOOTH is
+        // the modern Bluetooth + phone-hotspot mode, resources WIFI+BLUETOOTH
+        // +AUDIO. Detailed BT behavior lives in CarLifeBtBackendTest.
         val h = Harness()
         val device = ProjectionDevice(
-            "d", "p", CarLifeProjectionBackend.ID, transport = ProjectionTransport.BLUETOOTH,
+            "d", "vivo X", CarLifeProjectionBackend.ID, transport = ProjectionTransport.BLUETOOTH,
+        )
+        assertEquals(
+            setOf(ProjectionResource.WIFI, ProjectionResource.BLUETOOTH, ProjectionResource.AUDIO),
+            h.backend.requiredResourcesFor(device),
         )
         h.backend.connect(device)
-        assertTrue(h.provider.started.isEmpty())
-        assertTrue(h.backend.state is ProjectionState.Error)
-        assertTrue(h.backend.requiredResourcesFor(device).isEmpty())
+        assertEquals(CarLifeTransport.BT_HOTSPOT, h.provider.started.single().second)
     }
 
     // ---- Exclusive CarLife transport (section 23) ----

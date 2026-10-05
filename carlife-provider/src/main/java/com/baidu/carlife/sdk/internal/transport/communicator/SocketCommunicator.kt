@@ -8,6 +8,7 @@ import com.baidu.carlife.sdk.util.blockRead
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.BlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
@@ -21,6 +22,27 @@ open class SocketCommunicator(
 ) : Communicator {
     companion object {
         const val MAX_PACKET_SIZE = 10 * 1024
+
+        /**
+         * DiPlay host-local extension (Phase 9.2W-B1): explicit TCP connect
+         * timeout per channel. The plain `Socket(host, port)` constructor
+         * blocks with the OS default (can be 20s+), which made channel-set
+         * teardown unbounded. Chosen value: 4000 ms (within the recommended
+         * 3000-5000 ms window), documented in docs/CARLIFE_MODERN_WIRELESS.md.
+         * Protocol framing is untouched.
+         */
+        const val CONNECT_TIMEOUT_MS = 4_000
+
+        private fun connectWithTimeout(host: String, port: Int): Socket {
+            val socket = Socket()
+            try {
+                socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+            } catch (e: Exception) {
+                runCatching { socket.close() } // never leak a half-open socket
+                throw e
+            }
+            return socket
+        }
     }
 
     constructor(
@@ -29,7 +51,7 @@ open class SocketCommunicator(
         port: Int,
         callbacks: Communicator.Callbacks? = null,
         messageQueue: BlockingQueue<CarLifeMessage>? = null
-    ) : this(channel, Socket(host, port), callbacks, messageQueue)
+    ) : this(channel, connectWithTimeout(host, port), callbacks, messageQueue)
 
     private var isTerminated = AtomicBoolean(false)
 
